@@ -67,7 +67,8 @@ static ArmLIR *loadFPConstantValue(CompilationUnit *cUnit, int rDest,
     loadPcRel->operands[1] = r15pc;
     setupResourceMasks(loadPcRel);
     setMemRefType(loadPcRel, true, kLiteral);
-    loadPcRel->aliasInfo = dataTarget->operands[0];
+    // TODO: rework literal load disambiguation to more cleanly handle 64-bit loads
+    loadPcRel->aliasInfo = (uintptr_t)dataTarget;
     dvmCompilerAppendLIR(cUnit, (LIR *) loadPcRel);
     return loadPcRel;
 }
