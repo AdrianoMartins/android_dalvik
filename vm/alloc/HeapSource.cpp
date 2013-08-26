@@ -37,15 +37,9 @@ static void setIdealFootprint(size_t max);
 static size_t getMaximumSize(const HeapSource *hs);
 static void trimHeaps();
 
-#ifdef DALVIK_LOWMEM
-static const bool lowmem = true;
-#else
-static const bool lowmem = false;
-#endif
-
 #define HEAP_UTILIZATION_MAX        1024
 #define DEFAULT_HEAP_UTILIZATION    512     // Range 1..HEAP_UTILIZATION_MAX
-#define HEAP_IDEAL_FREE_DEFAULT     (2 * 1024 * 1024)
+#define HEAP_IDEAL_FREE_DEFAULT     (7.2 * 1024 * 1024)
 static unsigned int heapIdeaFree = HEAP_IDEAL_FREE_DEFAULT;
 #define HEAP_MIN_FREE               ((heapIdeaFree) / 4)
 
@@ -378,21 +372,13 @@ static bool addNewHeap(HeapSource *hs)
                   overhead, hs->maximumSize);
         return false;
     }
-    if(lowmem) {
-        heap.maximumSize = hs->growthLimit - overhead;
-        heap.concurrentStartBytes = HEAP_MIN_FREE - concurrentStart;
-        heap.base = base;
-        heap.limit = heap.base + HEAP_MIN_FREE;
-        heap.msp = createMspace(base, HEAP_MIN_FREE, hs->maximumSize - overhead);
-    }
-    else {
-        size_t startSize = gDvm.heapStartingSize;
-        heap.maximumSize = hs->growthLimit - overhead;
-        heap.concurrentStartBytes = startSize - concurrentStart;
-        heap.base = base;
-        heap.limit = heap.base + heap.maximumSize;
-        heap.msp = createMspace(base, startSize * 2, hs->maximumSize - overhead);
-    }
+
+    size_t startSize = gDvm.heapStartingSize;
+    heap.maximumSize = hs->growthLimit - overhead;
+    heap.concurrentStartBytes = startSize - concurrentStart;
+    heap.base = base;
+    heap.limit = heap.base + heap.maximumSize;
+    heap.msp = createMspace(base, startSize * 2, hs->maximumSize - overhead);
     if (heap.msp == NULL) {
         return false;
     }
@@ -614,16 +600,7 @@ bool dvmHeapSourceStartupAfterZygote()
     HeapSource *hs = gHs;
     hs->softLimit=SIZE_MAX;
     hs->heaps[0].concurrentStartBytes = mspace_footprint(hs->heaps[0].msp) - concurrentStart;
-    if(lowmem) {
-        return gDvm.concurrentMarkSweep ? gcDaemonStartup() : true;
-    }
-    else {
-        HeapSource* hs    = gHs;
-        
-        hs->softLimit=SIZE_MAX;
-        hs->heaps[0].concurrentStartBytes = mspace_footprint(hs->heaps[0].msp) - concurrentStart;
-        return gDvm.concurrentMarkSweep ? gcDaemonStartup() : true;
-    }
+    return gDvm.concurrentMarkSweep ? gcDaemonStartup() : true;
 }
 
 /*
