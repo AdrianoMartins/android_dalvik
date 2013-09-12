@@ -33,10 +33,19 @@
 #include <paths.h>
 #include <sys/personality.h>
 #include <cutils/sched_policy.h>
+#include <sys/cdefs.h>
+#include <linux/capability.h>
 
 #if defined(HAVE_PRCTL)
 # include <sys/prctl.h>
 #endif
+
+__BEGIN_DECLS
+
+extern int capget(cap_user_header_t hdrp, cap_user_data_t datap);
+extern int capset(cap_user_header_t hdrp, const cap_user_data_t datap);
+
+__END_DECLS
 
 #define ZYGOTE_LOG_TAG "Zygote"
 
