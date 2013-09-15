@@ -237,28 +237,6 @@ static void countWhiteReferenceVisitor(void *addr, void *arg)
 }
 
 /*
- * Visitor that logs white references.
- */
-static void dumpWhiteReferenceVisitor(void *addr, void *arg)
-{
-    WhiteReferenceCounter *ctx;
-    Object *obj;
-
-    assert(addr != NULL);
-    assert(arg != NULL);
-    obj = *(Object **)addr;
-    if (obj == NULL) {
-        return;
-    }
-    assert(dvmIsValidObject(obj));
-    ctx = (WhiteReferenceCounter*)arg;
-    if (dvmHeapBitmapIsObjectBitSet(ctx->markBits, obj)) {
-        return;
-    }
-    ALOGE("object %p is white", obj);
-}
-
-/*
  * Visitor that signals the caller when a matching reference is found.
  */
 static void dumpReferencesVisitor(void *pObj, void *arg)
@@ -382,7 +360,6 @@ static void verifyCardTableCallback(Object *obj, void *arg)
     } else {
         ALOGE("Verify failed, object %p is gray and on an unmarked card", obj);
         dvmDumpObject(obj);
-        dvmVisitObject(dumpWhiteReferenceVisitor, obj, &ctx);
         dumpReferences(obj);
         dvmAbort();
     }
