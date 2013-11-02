@@ -1253,6 +1253,9 @@ static void dumpFrames(const DebugOutputTarget* target, void* framePtr,
                         if (obj->clazz == gDvm.classJavaLangVMThread) {
                             joinThread = dvmGetThreadFromThreadObject(obj);
                         }
+                        if (joinThread == NULL) {
+                            joinThread = dvmGetObjectLockHolder(obj);
+                        }
                         printWaitMessage(target, "on", obj, joinThread);
                     }
                 } else if (thread->status == THREAD_MONITOR) {
@@ -1401,6 +1404,8 @@ void dvmDumpNativeStack(const DebugOutputTarget* target, pid_t tid)
         }
 
         free_backtrace_symbols(backtrace_symbols, frames);
+    } else {
+        dvmPrintDebugMessage(target, "  (native backtrace unavailable)\n");
     }
 #endif
 }

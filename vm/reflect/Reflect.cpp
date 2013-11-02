@@ -226,7 +226,7 @@ static Object* createFieldObject(Field* field, const ClassObject* clazz)
     ClassObject* type;
     char* mangle;
     char* cp;
-    int slot;
+    int slot, field_idx;
 
     assert(dvmIsClassInitialized(gDvm.classJavaLangReflectField));
 
@@ -245,10 +245,11 @@ static Object* createFieldObject(Field* field, const ClassObject* clazz)
         goto bail;
 
     slot = fieldToSlot(field, clazz);
+    field_idx = dvmGetFieldIdx(field);
 
     JValue unused;
     dvmCallMethod(dvmThreadSelf(), gDvm.methJavaLangReflectField_init,
-        fieldObj, &unused, clazz, type, nameObj, slot);
+        fieldObj, &unused, clazz, type, nameObj, slot, field_idx);
     if (dvmCheckException(dvmThreadSelf())) {
         ALOGD("Field class init threw exception");
         goto bail;
@@ -393,7 +394,7 @@ static Object* createConstructorObject(Method* meth)
     Object* consObj;
     DexStringCache mangle;
     char* cp;
-    int slot;
+    int slot, method_idx;
 
     dexStringCacheInit(&mangle);
 
@@ -425,10 +426,11 @@ static Object* createConstructorObject(Method* meth)
         goto bail;
 
     slot = methodToSlot(meth);
+    method_idx = dvmGetMethodIdx(meth);
 
     JValue unused;
     dvmCallMethod(dvmThreadSelf(), gDvm.methJavaLangReflectConstructor_init,
-        consObj, &unused, meth->clazz, params, exceptions, slot);
+        consObj, &unused, meth->clazz, params, exceptions, slot, method_idx);
     if (dvmCheckException(dvmThreadSelf())) {
         ALOGD("Constructor class init threw exception");
         goto bail;
@@ -532,7 +534,7 @@ Object* dvmCreateReflectMethodObject(const Method* meth)
     ClassObject* returnType;
     DexStringCache mangle;
     char* cp;
-    int slot;
+    int slot, method_idx;
 
     if (dvmCheckException(dvmThreadSelf())) {
         ALOGW("WARNING: dvmCreateReflectMethodObject called with "
@@ -577,11 +579,12 @@ Object* dvmCreateReflectMethodObject(const Method* meth)
         goto bail;
 
     slot = methodToSlot(meth);
+    method_idx = dvmGetMethodIdx(meth);
 
     JValue unused;
     dvmCallMethod(dvmThreadSelf(), gDvm.methJavaLangReflectMethod_init,
         methObj, &unused, meth->clazz, params, exceptions, returnType,
-        nameObj, slot);
+        nameObj, slot, method_idx);
     if (dvmCheckException(dvmThreadSelf())) {
         ALOGD("Method class init threw exception");
         goto bail;
@@ -901,6 +904,9 @@ int dvmConvertPrimitiveValue(PrimitiveType srcType,
     };
 
     enum Conversion conv;
+#ifdef ARCH_HAVE_ALIGNED_DOUBLES
+    double ret;
+#endif
 
     assert((srcType != PRIM_VOID) && (srcType != PRIM_NOT));
     assert((dstType != PRIM_VOID) && (dstType != PRIM_NOT));
@@ -978,9 +984,15 @@ int dvmConvertPrimitiveValue(PrimitiveType srcType,
         case OK4:  *dstPtr = *srcPtr;                                   return 1;
         case OK8:  *(s8*) dstPtr = *(s8*)srcPtr;                        return 2;
         case ItoJ: *(s8*) dstPtr = (s8) (*(s4*) srcPtr);                return 2;
+#ifndef ARCH_HAVE_ALIGNED_DOUBLES
         case ItoD: *(double*) dstPtr = (double) (*(s4*) srcPtr);        return 2;
         case JtoD: *(double*) dstPtr = (double) (*(long long*) srcPtr); return 2;
         case FtoD: *(double*) dstPtr = (double) (*(float*) srcPtr);     return 2;
+#else
+        case ItoD: ret = (double) (*(s4*) srcPtr); memcpy(dstPtr, &ret, 8); return 2;
+        case JtoD: ret = (double) (*(long long*) srcPtr); memcpy(dstPtr, &ret, 8); return 2;
+        case FtoD: ret = (double) (*(float*) srcPtr); memcpy(dstPtr, &ret, 8); return 2;
+#endif
         case ItoF: *(float*) dstPtr = (float) (*(int*) srcPtr);         return 1;
         case JtoF: *(float*) dstPtr = (float) (*(long long*) srcPtr);   return 1;
         case bad: {

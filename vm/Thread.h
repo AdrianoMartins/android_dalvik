@@ -92,7 +92,7 @@ union InterpBreak {
 #ifndef DVM_NO_ASM_INTERP
         void* curHandlerTable;
 #else
-        void* unused;
+        int32_t    unused1;
 #endif
     } ctl;
 };
@@ -287,6 +287,10 @@ struct Thread {
     bool        cpuClockBaseSet;
     u8          cpuClockBase;
 
+    /* previous stack trace sample and length (used by sampling profiler) */
+    const Method** stackTraceSample;
+    size_t stackTraceSampleLength;
+
     /* memory allocation profiling state */
     AllocProfState allocProf;
 
@@ -303,6 +307,10 @@ struct Thread {
     pthread_mutex_t   callbackMutex;
     SafePointCallback callback;
     void*             callbackArg;
+
+#if defined(ARCH_IA32) && defined(WITH_JIT)
+    u4 spillRegion[MAX_SPILL_JIT_IA];
+#endif
 };
 
 /* start point for an internal thread; mimics pthread args */
@@ -354,6 +362,7 @@ enum SuspendCause {
     SUSPEND_FOR_DEX_OPT,
     SUSPEND_FOR_VERIFY,
     SUSPEND_FOR_HPROF,
+    SUSPEND_FOR_SAMPLING,
 #if defined(WITH_JIT)
     SUSPEND_FOR_TBL_RESIZE,  // jit-table resize
     SUSPEND_FOR_IC_PATCH,    // polymorphic callsite inline-cache patch

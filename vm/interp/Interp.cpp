@@ -766,9 +766,7 @@ static void updateDebugger(const Method* method, const u2* pc, const u4* fp,
     if (pCtrl->active && pCtrl->thread == self) {
         int frameDepth;
         bool doStop = false;
-#ifndef LOG_NDEBUG
         const char* msg = NULL;
-#endif
 
         assert(!dvmIsNativeMethod(method));
 
@@ -780,20 +778,14 @@ static void updateDebugger(const Method* method, const u2* pc, const u4* fp,
              */
             if (pCtrl->method != method) {
                 doStop = true;
-#ifndef LOG_NDEBUG
                 msg = "new method";
-#endif
             } else if (pCtrl->size == SS_MIN) {
                 doStop = true;
-#ifndef LOG_NDEBUG
                 msg = "new instruction";
-#endif
             } else if (!dvmAddressSetGet(
                     pCtrl->pAddressSet, pc - method->insns)) {
                 doStop = true;
-#ifndef LOG_NDEBUG
                 msg = "new line";
-#endif
             }
         } else if (pCtrl->depth == SD_OVER) {
             /*
@@ -807,22 +799,16 @@ static void updateDebugger(const Method* method, const u2* pc, const u4* fp,
             if (frameDepth < pCtrl->frameDepth) {
                 /* popped up one or more frames, always trigger */
                 doStop = true;
-#ifndef LOG_NDEBUG
                 msg = "method pop";
-#endif
             } else if (frameDepth == pCtrl->frameDepth) {
                 /* same depth, see if we moved */
                 if (pCtrl->size == SS_MIN) {
                     doStop = true;
-#ifndef LOG_NDEBUG
                     msg = "new instruction";
-#endif
                 } else if (!dvmAddressSetGet(pCtrl->pAddressSet,
                             pc - method->insns)) {
                     doStop = true;
-#ifndef LOG_NDEBUG
                     msg = "new line";
-#endif
                 }
             }
         } else {
@@ -838,9 +824,7 @@ static void updateDebugger(const Method* method, const u2* pc, const u4* fp,
             frameDepth = dvmComputeVagueFrameDepth(self, fp);
             if (frameDepth < pCtrl->frameDepth) {
                 doStop = true;
-#ifndef LOG_NDEBUG
                 msg = "method pop";
-#endif
             }
         }
 
@@ -862,8 +846,8 @@ static void updateDebugger(const Method* method, const u2* pc, const u4* fp,
      * terminates "with a thrown exception".
      */
     u2 opcode = GET_OPCODE(*pc);
-    if (opcode == OP_RETURN_VOID || opcode == OP_RETURN ||
-        opcode == OP_RETURN_WIDE ||opcode == OP_RETURN_OBJECT)
+    if (opcode == OP_RETURN_VOID || opcode == OP_RETURN || opcode == OP_RETURN_VOID_BARRIER ||
+        opcode == OP_RETURN_OBJECT || opcode == OP_RETURN_WIDE)
     {
         eventFlags |= DBG_METHOD_EXIT;
     }
@@ -1007,24 +991,6 @@ void dvmDumpRegs(const Method* method, const u4* framePtr, bool inOnly)
  */
 
 /*
- * Construct an s4 from two consecutive half-words of switch data.
- * This needs to check endianness because the DEX optimizer only swaps
- * half-words in instruction stream.
- *
- * "switchData" must be 32-bit aligned.
- */
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-static inline s4 s4FromSwitchData(const void* switchData) {
-    return *(s4*) switchData;
-}
-#else
-static inline s4 s4FromSwitchData(const void* switchData) {
-    u2* data = switchData;
-    return data[0] | (((s4) data[1]) << 16);
-}
-#endif
-
-/*
  * Find the matching case.  Returns the offset to the handler instructions.
  *
  * Returns 3 if we don't find a match (it's the size of the packed-switch
@@ -1033,9 +999,6 @@ static inline s4 s4FromSwitchData(const void* switchData) {
 s4 dvmInterpHandlePackedSwitch(const u2* switchData, s4 testVal)
 {
     const int kInstrLen = 3;
-    u2 size;
-    s4 firstKey;
-    const s4* entries;
 
     /*
      * Packed switch data format:
@@ -1052,13 +1015,14 @@ s4 dvmInterpHandlePackedSwitch(const u2* switchData, s4 testVal)
         return kInstrLen;
     }
 
-    size = *switchData++;
+    u2 size = *switchData++;
     assert(size > 0);
 
-    firstKey = *switchData++;
+    s4 firstKey = *switchData++;
     firstKey |= (*switchData++) << 16;
 
-    if (testVal < firstKey || testVal >= firstKey + size) {
+    int index = testVal - firstKey;
+    if (index < 0 || index >= size) {
         LOGVV("Value %d not found in switch (%d-%d)",
             testVal, firstKey, firstKey+size-1);
         return kInstrLen;
@@ -1067,14 +1031,14 @@ s4 dvmInterpHandlePackedSwitch(const u2* switchData, s4 testVal)
     /* The entries are guaranteed to be aligned on a 32-bit boundary;
      * we can treat them as a native int array.
      */
-    entries = (const s4*) switchData;
+    const s4* entries = (const s4*) switchData;
     assert(((u4)entries & 0x3) == 0);
 
-    assert(testVal - firstKey >= 0 && testVal - firstKey < size);
+    assert(index >= 0 && index < size);
     LOGVV("Value %d found in slot %d (goto 0x%02x)",
-        testVal, testVal - firstKey,
-        s4FromSwitchData(&entries[testVal - firstKey]));
-    return s4FromSwitchData(&entries[testVal - firstKey]);
+        testVal, index,
+        s4FromSwitchData(&entries[index]));
+    return s4FromSwitchData(&entries[index]);
 }
 
 /*
@@ -1499,8 +1463,10 @@ void updateInterpBreak(Thread* thread, ExecutionSubModes subMode, bool enable)
             newValue.ctl.breakFlags |= kInterpSingleStep;
         if (newValue.ctl.subMode & SAFEPOINT_BREAK_MASK)
             newValue.ctl.breakFlags |= kInterpSafePoint;
+#ifndef DVM_NO_ASM_INTERP
         newValue.ctl.curHandlerTable = (newValue.ctl.breakFlags) ?
             thread->altHandlerTable : thread->mainHandlerTable;
+#endif
     } while (dvmQuasiAtomicCas64(oldValue.all, newValue.all,
              &thread->interpBreak.all) != 0);
 }
@@ -1572,12 +1538,16 @@ void dvmCheckInterpStateConsistency()
     Thread* thread;
     uint8_t breakFlags;
     uint8_t subMode;
+#ifndef DVM_NO_ASM_INTERP
     void* handlerTable;
+#endif
 
     dvmLockThreadList(self);
     breakFlags = self->interpBreak.ctl.breakFlags;
     subMode = self->interpBreak.ctl.subMode;
+#ifndef DVM_NO_ASM_INTERP
     handlerTable = self->interpBreak.ctl.curHandlerTable;
+#endif
     for (thread = gDvm.threadList; thread != NULL; thread = thread->next) {
         if (subMode != thread->interpBreak.ctl.subMode) {
             ALOGD("Warning: subMode mismatch - %#x:%#x, tid[%d]",
@@ -1587,11 +1557,13 @@ void dvmCheckInterpStateConsistency()
             ALOGD("Warning: breakFlags mismatch - %#x:%#x, tid[%d]",
                 breakFlags,thread->interpBreak.ctl.breakFlags,thread->threadId);
          }
+#ifndef DVM_NO_ASM_INTERP
         if (handlerTable != thread->interpBreak.ctl.curHandlerTable) {
             ALOGD("Warning: curHandlerTable mismatch - %#x:%#x, tid[%d]",
                 (int)handlerTable,(int)thread->interpBreak.ctl.curHandlerTable,
                 thread->threadId);
          }
+#endif
 #if defined(WITH_JIT)
          if (thread->pJitProfTable != gDvmJit.pProfTable) {
              ALOGD("Warning: pJitProfTable mismatch - %#x:%#x, tid[%d]",
@@ -1688,8 +1660,13 @@ void dvmInitializeInterpBreak(Thread* thread)
     if (gDvm.instructionCountEnableCount > 0) {
         dvmEnableSubMode(thread, kSubModeInstCounting);
     }
-    if (dvmIsMethodTraceActive()) {
-        dvmEnableSubMode(thread, kSubModeMethodTrace);
+    TracingMode mode = dvmGetMethodTracingMode();
+    if (mode != TRACING_INACTIVE) {
+        if (mode == SAMPLE_PROFILING_ACTIVE) {
+            dvmEnableSubMode(thread, kSubModeSampleTrace);
+        } else {
+            dvmEnableSubMode(thread, kSubModeMethodTrace);
+        }
     }
     if (gDvm.emulatorTraceEnableCount > 0) {
         dvmEnableSubMode(thread, kSubModeEmulatorTrace);
@@ -1939,7 +1916,6 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
 #endif
     self->debugIsMethodEntry = true;
 #if defined(WITH_JIT)
-    dvmJitCalleeSave(calleeSave);
     /* Initialize the state to kJitNot */
     self->jitState = kJitNot;
 #endif
@@ -1973,7 +1949,9 @@ void dvmInterpret(Thread* self, const Method* method, JValue* pResult)
     if (gDvm.executionMode == kExecutionModeInterpFast)
         stdInterp = dvmMterpStd;
 #if defined(WITH_JIT)
-    else if (gDvm.executionMode == kExecutionModeJit)
+    else if (gDvm.executionMode == kExecutionModeJit ||
+             gDvm.executionMode == kExecutionModeNcgO0 ||
+             gDvm.executionMode == kExecutionModeNcgO1)
         stdInterp = dvmMterpStd;
 #endif
     else

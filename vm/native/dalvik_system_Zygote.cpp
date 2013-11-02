@@ -20,19 +20,24 @@
 #include "Dalvik.h"
 #include "native/InternalNativePriv.h"
 
+#include <selinux/android.h>
+
 #include <signal.h>
-#if (__GNUC__ == 4 && __GNUC_MINOR__ == 7)
-#include <sys/resource.h>
-#endif
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
-#include <stdio.h>
 #include <grp.h>
 #include <errno.h>
 #include <paths.h>
 #include <sys/personality.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <linux/fs.h>
+#include <cutils/fs.h>
 #include <cutils/sched_policy.h>
+#include <cutils/multiuser.h>
+#include <sched.h>
+#include <sys/utsname.h>
+#include <sys/capability.h>
 
 #if defined(HAVE_PRCTL)
 # include <sys/prctl.h>
@@ -47,6 +52,14 @@ enum {
     DEBUG_ENABLE_ASSERT             = 1 << 2,
     DEBUG_ENABLE_SAFEMODE           = 1 << 3,
     DEBUG_ENABLE_JNI_LOGGING        = 1 << 4,
+};
+
+/* must match values in dalvik.system.Zygote */
+enum {
+    MOUNT_EXTERNAL_NONE = 0,
+    MOUNT_EXTERNAL_SINGLEUSER = 1,
+    MOUNT_EXTERNAL_MULTIUSER = 2,
+    MOUNT_EXTERNAL_MULTIUSER_ALL = 3,
 };
 
 /*
@@ -230,6 +243,78 @@ static int setrlimitsFromArray(ArrayObject* rlimits)
     return 0;
 }
 
+/*
+ * Create a private mount namespace and bind mount appropriate emulated
+ * storage for the given user.
+ */
+static int mountEmulatedStorage(uid_t uid, u4 mountMode) {
+    // See storage config details at http://source.android.com/tech/storage/
+    userid_t userid = multiuser_get_user_id(uid);
+
+    // Create a second private mount namespace for our process
+    if (unshare(CLONE_NEWNS) == -1) {
+        ALOGE("Failed to unshare(): %s", strerror(errno));
+        return -1;
+    }
+
+    // Create bind mounts to expose external storage
+    if (mountMode == MOUNT_EXTERNAL_MULTIUSER
+            || mountMode == MOUNT_EXTERNAL_MULTIUSER_ALL) {
+        // These paths must already be created by init.rc
+        const char* source = getenv("EMULATED_STORAGE_SOURCE");
+        const char* target = getenv("EMULATED_STORAGE_TARGET");
+        const char* legacy = getenv("EXTERNAL_STORAGE");
+        if (source == NULL || target == NULL || legacy == NULL) {
+            ALOGE("Storage environment undefined; unable to provide external storage");
+            return -1;
+        }
+
+        // Prepare source paths
+        char source_user[PATH_MAX];
+        char target_user[PATH_MAX];
+
+        // /mnt/shell/emulated/0
+        snprintf(source_user, PATH_MAX, "%s/%d", source, userid);
+        // /storage/emulated/0
+        snprintf(target_user, PATH_MAX, "%s/%d", target, userid);
+
+        if (fs_prepare_dir(source_user, 0000, 0, 0) == -1
+                || fs_prepare_dir(target_user, 0000, 0, 0) == -1) {
+            return -1;
+        }
+
+        if (mountMode == MOUNT_EXTERNAL_MULTIUSER_ALL) {
+            // Mount entire external storage tree for all users
+            if (mount(source, target, NULL, MS_BIND, NULL) == -1) {
+                ALOGE("Failed to mount %s to %s: %s", source, target, strerror(errno));
+                return -1;
+            }
+        } else {
+            // Only mount user-specific external storage
+            if (mount(source_user, target_user, NULL, MS_BIND, NULL) == -1) {
+                ALOGE("Failed to mount %s to %s: %s", source_user, target_user, strerror(errno));
+                return -1;
+            }
+        }
+
+        if (fs_prepare_dir(legacy, 0000, 0, 0) == -1) {
+            return -1;
+        }
+
+        // Finally, mount user-specific path into place for legacy users
+        if (mount(target_user, legacy, NULL, MS_BIND | MS_REC, NULL) == -1) {
+            ALOGE("Failed to mount %s to %s: %s", target_user, legacy, strerror(errno));
+            return -1;
+        }
+
+    } else {
+        ALOGE("Mount mode %d unsupported", mountMode);
+        return -1;
+    }
+
+    return 0;
+}
+
 /* native public static int fork(); */
 static void Dalvik_dalvik_system_Zygote_fork(const u4* args, JValue* pResult)
 {
@@ -363,62 +448,40 @@ static int setCapabilities(int64_t permitted, int64_t effective)
 }
 
 /*
- * Basic KSM Support
+ * Set SELinux security context.
+ *
+ * Returns 0 on success, -1 on failure.
  */
-#ifndef MADV_MERGEABLE
-#define MADV_MERGEABLE 12
-#endif
-
-static inline void pushAnonymousPagesToKSM(void)
+static int setSELinuxContext(uid_t uid, bool isSystemServer,
+                             const char *seInfo, const char *niceName)
 {
-    FILE *fp;
-    char section[100];
-    char perms[5];
-    unsigned long start, end, misc;
-    int ch, offset;
-
-    fp = fopen("/proc/self/maps","r");
-
-    if (fp != NULL) {
-        while (fscanf(fp, "%lx-%lx %4s %lx %lx:%lx %ld",
-                 &start, &end, perms, &misc, &misc, &misc, &misc) == 7)
-        {
-            /* Read the sections name striping any preceeding spaces
-               and truncating to 100char (99 + \0)*/
-            section[0] = 0;
-            offset = 0;
-            while(1)
-            {
-                ch = fgetc(fp);
-                if (ch == '\n' || ch == EOF) {
-                    break;
-                }
-                if ((offset == 0) && (ch == ' ')) {
-                    continue;
-                }
-                if ((offset + 1) < 100) {
-                    section[offset]=ch;
-                    section[offset+1]=0;
-                    offset++;
-                }
-            }
-            /* now decide if we want to scan the section or not:
-               for now we scan Anonymous (sections with no file name) stack and
-               heap sections*/
-            if (( section[0] == 0) ||
-               (strcmp(section,"[stack]") == 0) ||
-               (strcmp(section,"[heap]") == 0))
-            {
-                /* The section matches pass it into madvise */
-                madvise((void*) start, (size_t) end-start, MADV_MERGEABLE);
-            }
-            if (ch == EOF) {
-                break;
-            }
-        }
-        fclose(fp);
-    }
+#ifdef HAVE_ANDROID_OS
+    return selinux_android_setcontext(uid, isSystemServer, seInfo, niceName);
+#else
+    return 0;
+#endif
 }
+
+static bool needsNoRandomizeWorkaround() {
+#if !defined(__arm__)
+    return false;
+#else
+    int major;
+    int minor;
+    struct utsname uts;
+    if (uname(&uts) == -1) {
+        return false;
+    }
+
+    if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
+        return false;
+    }
+
+    // Kernels before 3.4.* need the workaround.
+    return (major < 3) || ((major == 3) && (minor < 4));
+#endif
+}
+
 /*
  * Utility routine to fork zygote and specialize the child process.
  */
@@ -431,7 +494,10 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
     ArrayObject* gids = (ArrayObject *)args[2];
     u4 debugFlags = args[3];
     ArrayObject *rlimits = (ArrayObject *)args[4];
+    u4 mountMode = MOUNT_EXTERNAL_NONE;
     int64_t permittedCapabilities, effectiveCapabilities;
+    char *seInfo = NULL;
+    char *niceName = NULL;
 
     if (isSystemServer) {
         /*
@@ -444,7 +510,24 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
         permittedCapabilities = args[5] | (int64_t) args[6] << 32;
         effectiveCapabilities = args[7] | (int64_t) args[8] << 32;
     } else {
+        mountMode = args[5];
         permittedCapabilities = effectiveCapabilities = 0;
+        StringObject* seInfoObj = (StringObject*)args[6];
+        if (seInfoObj) {
+            seInfo = dvmCreateCstrFromString(seInfoObj);
+            if (!seInfo) {
+                ALOGE("seInfo dvmCreateCstrFromString failed");
+                dvmAbort();
+            }
+        }
+        StringObject* niceNameObj = (StringObject*)args[7];
+        if (niceNameObj) {
+            niceName = dvmCreateCstrFromString(niceNameObj);
+            if (!niceName) {
+                ALOGE("niceName dvmCreateCstrFromString failed");
+                dvmAbort();
+            }
+        }
     }
 
     if (!gDvm.zygote) {
@@ -482,38 +565,70 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             }
         }
 
+        for (int i = 0; prctl(PR_CAPBSET_READ, i, 0, 0, 0) >= 0; i++) {
+            err = prctl(PR_CAPBSET_DROP, i, 0, 0, 0);
+            if (err < 0) {
+                if (errno == EINVAL) {
+                    ALOGW("PR_CAPBSET_DROP %d failed: %s. "
+                          "Please make sure your kernel is compiled with "
+                          "file capabilities support enabled.",
+                          i, strerror(errno));
+                } else {
+                    ALOGE("PR_CAPBSET_DROP %d failed: %s.", i, strerror(errno));
+                    dvmAbort();
+                }
+            }
+        }
+
 #endif /* HAVE_ANDROID_OS */
 
-        err = setgroupsIntarray(gids);
+        if (mountMode != MOUNT_EXTERNAL_NONE) {
+            err = mountEmulatedStorage(uid, mountMode);
+            if (err < 0) {
+                ALOGE("cannot mountExternalStorage(): %s", strerror(errno));
 
+                if (errno == ENOTCONN || errno == EROFS) {
+                    // When device is actively encrypting, we get ENOTCONN here
+                    // since FUSE was mounted before the framework restarted.
+                    // When encrypted device is booting, we get EROFS since
+                    // FUSE hasn't been created yet by init.
+                    // In either case, continue without external storage.
+                } else {
+                    dvmAbort();
+                }
+            }
+        }
+
+        err = setgroupsIntarray(gids);
         if (err < 0) {
             ALOGE("cannot setgroups(): %s", strerror(errno));
             dvmAbort();
         }
 
         err = setrlimitsFromArray(rlimits);
-
         if (err < 0) {
             ALOGE("cannot setrlimit(): %s", strerror(errno));
             dvmAbort();
         }
 
-        err = setgid(gid);
+        err = setresgid(gid, gid, gid);
         if (err < 0) {
-            ALOGE("cannot setgid(%d): %s", gid, strerror(errno));
+            ALOGE("cannot setresgid(%d): %s", gid, strerror(errno));
             dvmAbort();
         }
 
-        err = setuid(uid);
+        err = setresuid(uid, uid, uid);
         if (err < 0) {
-            ALOGE("cannot setuid(%d): %s", uid, strerror(errno));
+            ALOGE("cannot setresuid(%d): %s", uid, strerror(errno));
             dvmAbort();
         }
 
-        int current = personality(0xffffFFFF);
-        int success = personality((ADDR_NO_RANDOMIZE | current));
-        if (success == -1) {
-          ALOGW("Personality switch failed. current=%d error=%d\n", current, errno);
+        if (needsNoRandomizeWorkaround()) {
+            int current = personality(0xffffFFFF);
+            int success = personality((ADDR_NO_RANDOMIZE | current));
+            if (success == -1) {
+                ALOGW("Personality switch failed. current=%d error=%d\n", current, errno);
+            }
         }
 
         err = setCapabilities(permittedCapabilities, effectiveCapabilities);
@@ -528,6 +643,17 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             ALOGE("cannot set_sched_policy(0, SP_DEFAULT): %s", strerror(-err));
             dvmAbort();
         }
+
+        err = setSELinuxContext(uid, isSystemServer, seInfo, niceName);
+        if (err < 0) {
+            ALOGE("cannot set SELinux context: %s\n", strerror(errno));
+            dvmAbort();
+        }
+        // These free(3) calls are safe because we know we're only ever forking
+        // a single-threaded process, so we know no other thread held the heap
+        // lock when we forked.
+        free(seInfo);
+        free(niceName);
 
         /*
          * Our system thread ID has changed.  Get the new one.
@@ -544,16 +670,19 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             ALOGE("error in post-zygote initialization");
             dvmAbort();
         }
-        pushAnonymousPagesToKSM();
     } else if (pid > 0) {
         /* the parent process */
+        free(seInfo);
+        free(niceName);
     }
 
     return pid;
 }
 
-/* native public static int forkAndSpecialize(int uid, int gid,
- *     int[] gids, int debugFlags);
+/*
+ * native public static int nativeForkAndSpecialize(int uid, int gid,
+ *     int[] gids, int debugFlags, int[][] rlimits, int mountExternal,
+ *     String seInfo, String niceName);
  */
 static void Dalvik_dalvik_system_Zygote_forkAndSpecialize(const u4* args,
     JValue* pResult)
@@ -565,9 +694,10 @@ static void Dalvik_dalvik_system_Zygote_forkAndSpecialize(const u4* args,
     RETURN_INT(pid);
 }
 
-/* native public static int forkSystemServer(int uid, int gid,
- *     int[] gids, int debugFlags, long permittedCapabilities,
- *     long effectiveCapabilities);
+/*
+ * native public static int nativeForkSystemServer(int uid, int gid,
+ *     int[] gids, int debugFlags, int[][] rlimits,
+ *     long permittedCapabilities, long effectiveCapabilities);
  */
 static void Dalvik_dalvik_system_Zygote_forkSystemServer(
         const u4* args, JValue* pResult)
@@ -593,30 +723,12 @@ static void Dalvik_dalvik_system_Zygote_forkSystemServer(
     RETURN_INT(pid);
 }
 
-/* native private static void nativeExecShell(String command);
- */
-static void Dalvik_dalvik_system_Zygote_execShell(
-        const u4* args, JValue* pResult)
-{
-    StringObject* command = (StringObject*)args[0];
-
-    const char *argp[] = {_PATH_BSHELL, "-c", NULL, NULL};
-    argp[2] = dvmCreateCstrFromString(command);
-
-    ALOGI("Exec: %s %s %s", argp[0], argp[1], argp[2]);
-
-    execv(_PATH_BSHELL, (char**)argp);
-    exit(127);
-}
-
 const DalvikNativeMethod dvm_dalvik_system_Zygote[] = {
     { "nativeFork", "()I",
       Dalvik_dalvik_system_Zygote_fork },
-    { "nativeForkAndSpecialize", "(II[II[[I)I",
+    { "nativeForkAndSpecialize", "(II[II[[IILjava/lang/String;Ljava/lang/String;)I",
       Dalvik_dalvik_system_Zygote_forkAndSpecialize },
     { "nativeForkSystemServer", "(II[II[[IJJ)I",
       Dalvik_dalvik_system_Zygote_forkSystemServer },
-    { "nativeExecShell", "(Ljava/lang/String;)V",
-      Dalvik_dalvik_system_Zygote_execShell },
     { NULL, NULL, NULL },
 };

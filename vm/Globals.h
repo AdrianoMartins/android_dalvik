@@ -90,6 +90,10 @@ struct DvmGlobals {
     size_t      heapStartingSize;
     size_t      heapMaximumSize;
     size_t      heapGrowthLimit;
+    bool        lowMemoryMode;
+    double      heapTargetUtilization;
+    size_t      heapMinFree;
+    size_t      heapMaxFree;
     size_t      stackSize;
     size_t      mainThreadStackSize;
 
@@ -153,6 +157,9 @@ struct DvmGlobals {
     AssertionControl*   assertionCtrl;
 
     ExecutionMode   executionMode;
+
+    bool        commonInit; /* whether common stubs are generated */
+    bool        constInit; /* whether global constants are initialized */
 
     /*
      * VM init management.
@@ -261,10 +268,11 @@ struct DvmGlobals {
     ClassObject* classJavaLangReflectMethod;
     ClassObject* classJavaLangReflectMethodArray;
     ClassObject* classJavaLangReflectProxy;
-    ClassObject* classJavaNioReadWriteDirectByteBuffer;
-    ClassObject* classOrgApacheHarmonyLangAnnotationAnnotationFactory;
-    ClassObject* classOrgApacheHarmonyLangAnnotationAnnotationMember;
-    ClassObject* classOrgApacheHarmonyLangAnnotationAnnotationMemberArray;
+    ClassObject* classJavaLangSystem;
+    ClassObject* classJavaNioDirectByteBuffer;
+    ClassObject* classLibcoreReflectAnnotationFactory;
+    ClassObject* classLibcoreReflectAnnotationMember;
+    ClassObject* classLibcoreReflectAnnotationMemberArray;
     ClassObject* classOrgApacheHarmonyDalvikDdmcChunk;
     ClassObject* classOrgApacheHarmonyDalvikDdmcDdmServer;
     ClassObject* classJavaLangRefFinalizerReference;
@@ -400,6 +408,9 @@ struct DvmGlobals {
     /* field offsets - java.lang.reflect.Proxy */
     int         offJavaLangReflectProxy_h;
 
+    /* direct method pointer - java.lang.System.runFinalization */
+    Method*     methJavaLangSystem_runFinalization;
+
     /* field offsets - java.io.FileDescriptor */
     int         offJavaIoFileDescriptor_descriptor;
 
@@ -408,7 +419,7 @@ struct DvmGlobals {
     Method*     methDalvikSystemNativeStart_run;
 
     /* assorted direct buffer helpers */
-    Method*     methJavaNioReadWriteDirectByteBuffer_init;
+    Method*     methJavaNioDirectByteBuffer_init;
     int         offJavaNioBuffer_capacity;
     int         offJavaNioBuffer_effectiveDirectAddress;
 
@@ -640,6 +651,7 @@ struct DvmGlobals {
     AllocRecord*    allocRecords;
     int             allocRecordHead;        /* most-recently-added entry */
     int             allocRecordCount;       /* #of valid entries */
+    int             allocRecordMax;         /* Number of allocated entries. */
 
     /*
      * When a profiler is enabled, this is incremented.  Distinct profilers
@@ -729,6 +741,8 @@ extern struct DvmGlobals gDvm;
 
 #if defined(WITH_JIT)
 
+#define DEFAULT_CODE_CACHE_SIZE 0xffffffff
+
 /* Trace profiling modes.  Ordering matters - off states before on states */
 enum TraceProfilingModes {
     kTraceProfilingDisabled = 0,      // Not profiling
@@ -793,7 +807,7 @@ struct DvmJitGlobals {
     /* How many entries in the JitEntryTable are in use */
     unsigned int jitTableEntriesUsed;
 
-    /* Bytes allocated for the code cache */
+    /* Max bytes allocated for the code cache.  Rough rule of thumb: 1K per 1M of system RAM */
     unsigned int codeCacheSize;
 
     /* Trigger for trace selection */
@@ -867,14 +881,27 @@ struct DvmJitGlobals {
     /* true/false: compile/reject methods specified in the -Xjitmethod list */
     bool includeSelectedMethod;
 
+    /* true/false: compile/reject traces with offset specified in the -Xjitoffset list */
+    bool includeSelectedOffset;
+
     /* Disable JIT for selected opcodes - one bit for each opcode */
     char opList[(kNumPackedOpcodes+7)/8];
 
     /* Disable JIT for selected methods */
     HashTable *methodTable;
 
+    /* Disable JIT for selected classes */
+    HashTable *classTable;
+
+    /* Disable JIT for selected offsets */
+    unsigned int pcTable[COMPILER_PC_OFFSET_SIZE];
+    int num_entries_pcTable;
+
     /* Flag to dump all compiled code */
     bool printMe;
+
+    /* Flag to dump compiled binary code in bytes */
+    bool printBinary;
 
     /* Per-process debug flag toggled when receiving a SIGUSR2 */
     bool receivedSIGUSR2;
@@ -943,6 +970,10 @@ struct DvmJitGlobals {
     u8                 compilerThreadBlockGCStart;
     u8                 compilerThreadBlockGCTime;
     u8                 maxCompilerThreadBlockGCTime;
+#endif
+
+#if defined(ARCH_IA32)
+    JitOptLevel        optLevel;
 #endif
 
     /* Place arrays at the end to ease the display in gdb sessions */

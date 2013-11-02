@@ -272,6 +272,11 @@ static void logContentionEvent(Thread *self, u4 waitMs, u4 samplePercent,
     size_t len;
     int fd;
 
+    /* When a thread is being destroyed it is normal that the frame depth is zero */
+    if (self->interpSave.curFrame == NULL) {
+        return;
+    }
+
     saveArea = SAVEAREA_FROM_FP(self->interpSave.curFrame);
     meth = saveArea->method;
     cp = eventBuffer;
@@ -753,12 +758,6 @@ done:
             dvmThrowInterruptedException(NULL);
         }
     }
-#ifdef NDEBUG
-    // ret is used only in assert() statements ==> not used in
-    // NDEBUG builds at all, causing variable defined but not
-    // used warning, breaking the build with -Werror
-    (void)ret;
-#endif
 }
 
 /*

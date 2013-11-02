@@ -25,6 +25,13 @@
 #define DALVIK_INTERP_STATE_H_
 
 /*
+ * For x86 JIT. In the lowered code sequences for bytecodes, at most 10
+ * temporary variables may be live at the same time. Therefore, at most
+ * 10 temporary variables can be spilled at the same time.
+*/
+#define MAX_SPILL_JIT_IA 10
+
+/*
  * Execution mode, e.g. interpreter vs. JIT.
  */
 enum ExecutionMode {
@@ -33,6 +40,10 @@ enum ExecutionMode {
     kExecutionModeInterpFast,
 #if defined(WITH_JIT)
     kExecutionModeJit,
+#endif
+#if defined(WITH_JIT)  /* IA only */
+    kExecutionModeNcgO0,
+    kExecutionModeNcgO1,
 #endif
 };
 
@@ -52,6 +63,7 @@ enum ExecutionSubModes {
     kSubModeCallbackPending   = 0x0020,
     kSubModeCountedStep       = 0x0040,
     kSubModeCheckAlways       = 0x0080,
+    kSubModeSampleTrace       = 0x0100,
     kSubModeJitTraceBuild     = 0x4000,
     kSubModeJitSV             = 0x8000,
     kSubModeDebugProfile   = (kSubModeMethodTrace |
@@ -180,7 +192,7 @@ enum SelfVerificationState {
 /* Number of entries in the 2nd level JIT profiler filter cache */
 #define JIT_TRACE_THRESH_FILTER_SIZE 32
 /* Number of low dalvik pc address bits to include in 2nd level filter key */
-#define JIT_TRACE_THRESH_FILTER_PC_BITS 4
+#define JIT_TRACE_THRESH_FILTER_PC_BITS 16
 #define MAX_JIT_RUN_LEN 64
 
 enum JitHint {
@@ -232,6 +244,15 @@ struct JitTraceRun {
     u4 unused:31;
 };
 
+#if defined(ARCH_IA32)
+/*
+ * JIT code genarator optimization level
+ */
+enum JitOptLevel {
+    kJitOptLevelO0 = 0,
+    kJitOptLevelO1 = 1,
+};
+#endif  // #if defined(ARCH_IA32)
 #endif
 
 #endif  // DALVIK_INTERP_STATE_H_

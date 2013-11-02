@@ -39,7 +39,6 @@ import com.android.dx.rop.cst.Constant;
 import com.android.dx.rop.cst.CstInteger;
 import com.android.dx.util.Bits;
 import com.android.dx.util.IntList;
-
 import java.util.ArrayList;
 
 /**
@@ -641,14 +640,17 @@ public final class RopTranslator {
             }
 
             CodeAddress dataAddress = new CodeAddress(pos);
+            // make a new address that binds closely to the switch instruction
+            CodeAddress switchAddress =
+                new CodeAddress(lastAddress.getPosition(), true);
             SwitchData dataInsn =
-                new SwitchData(pos, lastAddress, cases, switchTargets);
+                new SwitchData(pos, switchAddress, cases, switchTargets);
             Dop opcode = dataInsn.isPacked() ?
                 Dops.PACKED_SWITCH : Dops.SPARSE_SWITCH;
             TargetInsn switchInsn =
                 new TargetInsn(opcode, pos, getRegs(insn), dataAddress);
 
-            addOutput(lastAddress);
+            addOutput(switchAddress);
             addOutput(switchInsn);
 
             addOutputSuffix(new OddSpacer(pos));

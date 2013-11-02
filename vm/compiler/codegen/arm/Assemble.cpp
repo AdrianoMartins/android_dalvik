@@ -957,6 +957,7 @@ static AssemblerStatus assembleInstructions(CompilationUnit *cUnit,
         if (lir->opcode == kThumbLdrPcRel ||
             lir->opcode == kThumb2LdrPcRel12 ||
             lir->opcode == kThumbAddPcRel ||
+            ((lir->opcode == kThumb2Vldrd) && (lir->operands[1] == r15pc)) ||
             ((lir->opcode == kThumb2Vldrs) && (lir->operands[1] == r15pc))) {
             ArmLIR *lirTarget = (ArmLIR *) lir->generic.target;
             intptr_t pc = (lir->generic.offset + 4) & ~3;
@@ -981,7 +982,7 @@ static AssemblerStatus assembleInstructions(CompilationUnit *cUnit,
                 }
                 return kRetryHalve;
             }
-            if (lir->opcode == kThumb2Vldrs) {
+            if ((lir->opcode == kThumb2Vldrs) || (lir->opcode == kThumb2Vldrd)) {
                 lir->operands[2] = delta >> 2;
             } else {
                 lir->operands[1] = (lir->opcode == kThumb2LdrPcRel12) ?
@@ -1960,14 +1961,13 @@ void dvmJitUnchainAll()
 {
     u4* lowAddress = NULL;
     u4* highAddress = NULL;
-    unsigned int i;
     if (gDvmJit.pJitEntryTable != NULL) {
         COMPILER_TRACE_CHAINING(LOGD("Jit Runtime: unchaining all"));
         dvmLockMutex(&gDvmJit.tableLock);
 
         UNPROTECT_CODE_CACHE(gDvmJit.codeCache, gDvmJit.codeCacheByteUsed);
 
-        for (i = 0; i < gDvmJit.jitTableSize; i++) {
+        for (size_t i = 0; i < gDvmJit.jitTableSize; i++) {
             if (gDvmJit.pJitEntryTable[i].dPC &&
                 !gDvmJit.pJitEntryTable[i].u.info.isMethodEntry &&
                 gDvmJit.pJitEntryTable[i].codeAddress &&
@@ -2153,6 +2153,8 @@ void dvmCompilerSortAndPrintTraceProfiles()
     }
 
     ALOGD("JIT: Average execution count -> %d",(int)(sum / numTraces));
+    // How efficiently are we using code cache memory?  Bigger is better.
+    ALOGD("JIT: CodeCache efficiency -> %.2f",(float)sum / (float)gDvmJit.codeCacheByteUsed);
 
     /* Dump the sorted entries. The count of each trace will be reset to 0. */
     for (i=0; i < gDvmJit.jitTableSize; i++) {

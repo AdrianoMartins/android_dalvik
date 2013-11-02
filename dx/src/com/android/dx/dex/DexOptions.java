@@ -16,12 +16,17 @@
 
 package com.android.dx.dex;
 
+import com.android.dex.DexFormat;
+
 /**
  * Container for options used to control details of dex file generation.
  */
 public class DexOptions {
     /** target API level */
     public int targetApiLevel = DexFormat.API_NO_EXTENDED_OPCODES;
+
+    /** force generation of jumbo opcodes */
+    public boolean forceJumbo = false;
 
     /**
      * Gets the dex file magic number corresponding to this instance.

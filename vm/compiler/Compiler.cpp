@@ -21,9 +21,13 @@
 #include "Dalvik.h"
 #include "interp/Jit.h"
 #include "CompilerInternals.h"
+#ifdef ARCH_IA32
+#include "codegen/x86/Translator.h"
+#include "codegen/x86/Lower.h"
+#endif
 
 extern "C" void dvmCompilerTemplateStart(void);
-extern "C" void dmvCompilerTemplateEnd(void);
+extern "C" void dvmCompilerTemplateEnd(void);
 
 static inline bool workQueueLength(void)
 {
@@ -138,9 +142,6 @@ bool dvmCompilerWorkEnqueue(const u2 *pc, WorkOrderKind kind, void* info)
     gDvmJit.compilerQueueLength++;
     cc = pthread_cond_signal(&gDvmJit.compilerQueueActivity);
     assert(cc == 0);
-#ifdef NDEBUG
-    (void)cc; // prevent error on -Werror
-#endif
 
     dvmUnlockMutex(&gDvmJit.compilerLock);
     return result;
@@ -181,7 +182,7 @@ bool dvmCompilerSetupCodeCache(void)
                              MAP_PRIVATE , fd, 0);
     close(fd);
     if (gDvmJit.codeCache == MAP_FAILED) {
-        ALOGE("Failed to mmap the JIT code cache: %s", strerror(errno));
+        ALOGE("Failed to mmap the JIT code cache of size %d: %s", gDvmJit.codeCacheSize, strerror(errno));
         return false;
     }
 
@@ -190,8 +191,9 @@ bool dvmCompilerSetupCodeCache(void)
     /* This can be found through "dalvik-jit-code-cache" in /proc/<pid>/maps */
     // ALOGD("Code cache starts at %p", gDvmJit.codeCache);
 
+#ifndef ARCH_IA32
     /* Copy the template code into the beginning of the code cache */
-    int templateSize = (intptr_t) dmvCompilerTemplateEnd -
+    int templateSize = (intptr_t) dvmCompilerTemplateEnd -
                        (intptr_t) dvmCompilerTemplateStart;
     memcpy((void *) gDvmJit.codeCache,
            (void *) dvmCompilerTemplateStart,
@@ -211,6 +213,16 @@ bool dvmCompilerSetupCodeCache(void)
     /* Only flush the part in the code cache that is being used now */
     dvmCompilerCacheFlush((intptr_t) gDvmJit.codeCache,
                           (intptr_t) gDvmJit.codeCache + templateSize, 0);
+#else
+    gDvmJit.codeCacheByteUsed = 0;
+    stream = (char*)gDvmJit.codeCache + gDvmJit.codeCacheByteUsed;
+    ALOGV("codeCache = %p stream = %p before initJIT", gDvmJit.codeCache, stream);
+    streamStart = stream;
+    initJIT(NULL, NULL);
+    gDvmJit.templateSize = (stream - streamStart);
+    gDvmJit.codeCacheByteUsed = (stream - streamStart);
+    ALOGV("stream = %p after initJIT", stream);
+#endif
 
     int result = mprotect(gDvmJit.codeCache, gDvmJit.codeCacheSize,
                           PROTECT_CODE_CACHE_ATTRS);
@@ -316,9 +328,9 @@ static void resetCodeCache(void)
      * Wipe out the code cache content to force immediate crashes if
      * stale JIT'ed code is invoked.
      */
-    memset((char *) gDvmJit.codeCache + gDvmJit.templateSize,
-           0,
-           gDvmJit.codeCacheByteUsed - gDvmJit.templateSize);
+    dvmCompilerCacheClear((char *) gDvmJit.codeCache + gDvmJit.templateSize,
+                          gDvmJit.codeCacheByteUsed - gDvmJit.templateSize);
+
     dvmCompilerCacheFlush((intptr_t) gDvmJit.codeCache,
                           (intptr_t) gDvmJit.codeCache +
                           gDvmJit.codeCacheByteUsed, 0);
@@ -646,9 +658,6 @@ static void *compilerThreadStart(void *arg)
             int cc;
             cc = pthread_cond_signal(&gDvmJit.compilerQueueEmpty);
             assert(cc == 0);
-#ifdef NDEBUG
-            (void)cc; // prevent bug on -Werror
-#endif
             pthread_cond_wait(&gDvmJit.compilerQueueActivity,
                               &gDvmJit.compilerLock);
             continue;

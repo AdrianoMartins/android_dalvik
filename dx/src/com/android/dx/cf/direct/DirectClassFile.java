@@ -28,8 +28,8 @@ import com.android.dx.cf.iface.ParseObserver;
 import com.android.dx.cf.iface.StdAttributeList;
 import com.android.dx.rop.code.AccessFlags;
 import com.android.dx.rop.cst.ConstantPool;
-import com.android.dx.rop.cst.CstType;
 import com.android.dx.rop.cst.CstString;
+import com.android.dx.rop.cst.CstType;
 import com.android.dx.rop.cst.StdConstantPool;
 import com.android.dx.rop.type.StdTypeList;
 import com.android.dx.rop.type.Type;
@@ -226,6 +226,15 @@ public class DirectClassFile implements ClassFile {
         }
 
         this.attributeFactory = attributeFactory;
+    }
+
+    /**
+     * Gets the path where this class file is located.
+     *
+     * @return {@code non-null;} the filePath
+     */
+    public String getFilePath() {
+      return filePath;
     }
 
     /**

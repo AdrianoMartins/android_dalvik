@@ -4,7 +4,7 @@
  * ===========================================================================
  */
 
-    .text
+    .section .data.rel.ro
     .align  2
 .LinvokeNative:
     @ Prep for the native call
@@ -123,7 +123,7 @@
 .L__aeabi_cfcmple:
     .word   __aeabi_cfcmple
 
-    .global dmvCompilerTemplateEnd
-dmvCompilerTemplateEnd:
+    .global dvmCompilerTemplateEnd
+dvmCompilerTemplateEnd:
 
 #endif /* WITH_JIT */

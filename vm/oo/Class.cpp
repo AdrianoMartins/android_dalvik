@@ -1740,6 +1740,9 @@ static ClassObject* loadClassFromDex0(DvmDex* pDvmDex,
      * Make sure the aren't any "bonus" flags set, since we use them for
      * runtime state.
      */
+    /* bits we can reasonably expect to see set in a DEX access flags field */
+    const uint32_t EXPECTED_FILE_FLAGS = (ACC_CLASS_MASK | CLASS_ISPREVERIFIED |
+                                          CLASS_ISOPTIMIZED);
     if ((pClassDef->accessFlags & ~EXPECTED_FILE_FLAGS) != 0) {
         ALOGW("Invalid file flags in class %s: %04x",
             descriptor, pClassDef->accessFlags);
@@ -2913,15 +2916,25 @@ static bool createVtable(ClassObject* clazz)
             for (si = 0; si < clazz->super->vtableCount; si++) {
                 Method* superMeth = clazz->vtable[si];
 
-                if (dvmCompareMethodNamesAndProtos(localMeth, superMeth) == 0)
-                {
-                    /* verify */
+                if (dvmCompareMethodNamesAndProtos(localMeth, superMeth) == 0) {
+                    // We should have an access check here, but some apps rely on us not
+                    // checking access: http://b/7301030
+                    bool isAccessible = dvmCheckMethodAccess(clazz, superMeth);
                     if (dvmIsFinalMethod(superMeth)) {
-                        ALOGW("Method %s.%s overrides final %s.%s",
-                            localMeth->clazz->descriptor, localMeth->name,
-                            superMeth->clazz->descriptor, superMeth->name);
+                        ALOGE("Method %s.%s overrides final %s.%s",
+                              localMeth->clazz->descriptor, localMeth->name,
+                              superMeth->clazz->descriptor, superMeth->name);
                         goto bail;
                     }
+
+                    // Warn if we just spotted code relying on this bug...
+                    if (!isAccessible) {
+                        ALOGW("method %s.%s incorrectly overrides "
+                              "package-private method with same name in %s",
+                              localMeth->clazz->descriptor, localMeth->name,
+                              superMeth->clazz->descriptor);
+                    }
+
                     clazz->vtable[si] = localMeth;
                     localMeth->methodIndex = (u2) si;
                     //ALOGV("+++   override %s.%s (slot %d)",
@@ -3222,7 +3235,9 @@ static bool createIftable(ClassObject* clazz)
                     == 0)
                 {
                     LOGVV("INTF:   matched at %d", j);
-                    if (!dvmIsPublicMethod(clazz->vtable[j])) {
+                    if (!dvmIsAbstractMethod(clazz->vtable[j]) &&
+                        !dvmIsPublicMethod(clazz->vtable[j]))
+                    {
                         ALOGW("Implementation of %s.%s is not public",
                             clazz->descriptor, clazz->vtable[j]->name);
                         dvmThrowIllegalAccessError(

@@ -23,13 +23,24 @@
 #include <signal.h>
 #include <limits.h>
 #include <ctype.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
+#include <linux/fs.h>
+#include <cutils/fs.h>
 #include <unistd.h>
+#ifdef HAVE_ANDROID_OS
+#include <sys/prctl.h>
+#endif
 
 #include "Dalvik.h"
 #include "test/Test.h"
 #include "mterp/Mterp.h"
 #include "Hash.h"
+#include "JniConstants.h"
+
+#if defined(WITH_JIT)
+#include "compiler/codegen/Optimizer.h"
+#endif
 
 #define kMinHeapStartSize   (1*1024*1024)
 #define kMinHeapSize        (2*1024*1024)
@@ -128,9 +139,13 @@ static void usage(const char* progName)
                        "[,hexopvalue[-endvalue]]*\n");
     dvmFprintf(stderr, "  -Xincludeselectedmethod\n");
     dvmFprintf(stderr, "  -Xjitthreshold:decimalvalue\n");
+    dvmFprintf(stderr, "  -Xjitcodecachesize:decimalvalueofkbytes\n");
     dvmFprintf(stderr, "  -Xjitblocking\n");
     dvmFprintf(stderr, "  -Xjitmethod:signature[,signature]* "
                        "(eg Ljava/lang/String\\;replace)\n");
+    dvmFprintf(stderr, "  -Xjitclass:classname[,classname]*\n");
+    dvmFprintf(stderr, "  -Xjitoffset:offset[,offset]\n");
+    dvmFprintf(stderr, "  -Xjitconfig:filename\n");
     dvmFprintf(stderr, "  -Xjitcheckcg\n");
     dvmFprintf(stderr, "  -Xjitverbose\n");
     dvmFprintf(stderr, "  -Xjitprofile\n");
@@ -227,16 +242,16 @@ static void showVersion()
  * Returns 0 (a useless size) if "s" is malformed or specifies a low or
  * non-evenly-divisible value.
  */
-static size_t parseMemOption(const char *s, size_t div)
+static size_t parseMemOption(const char* s, size_t div)
 {
     /* strtoul accepts a leading [+-], which we don't want,
      * so make sure our string starts with a decimal digit.
      */
     if (isdigit(*s)) {
-        const char *s2;
+        const char* s2;
         size_t val;
 
-        val = strtoul(s, (char **)&s2, 10);
+        val = strtoul(s, (char* *)&s2, 10);
         if (s2 != s) {
             /* s2 should be pointing just after the number.
              * If this is the end of the string, the user
@@ -547,11 +562,11 @@ static void freeAssertionCtrl()
 
 #if defined(WITH_JIT)
 /* Parse -Xjitop to selectively turn on/off certain opcodes for JIT */
-static void processXjitop(const char *opt)
+static void processXjitop(const char* opt)
 {
     if (opt[7] == ':') {
-        const char *startPtr = &opt[8];
-        char *endPtr = NULL;
+        const char* startPtr = &opt[8];
+        char* endPtr = NULL;
 
         do {
             long startValue, endValue;
@@ -600,15 +615,50 @@ static void processXjitop(const char *opt)
     }
 }
 
-/* Parse -Xjitmethod to selectively turn on/off certain methods for JIT */
-static void processXjitmethod(const char *opt)
-{
-    char *buf = strdup(&opt[12]);
-    char *start, *end;
-
-    gDvmJit.methodTable = dvmHashTableCreate(8, NULL);
-
+/* Parse -Xjitoffset to selectively turn on/off traces with certain offsets for JIT */
+static void processXjitoffset(const char* opt) {
+    gDvmJit.num_entries_pcTable = 0;
+    char* buf = strdup(opt);
+    char* start, *end;
     start = buf;
+    int idx = 0;
+    do {
+        end = strchr(start, ',');
+        if (end) {
+            *end = 0;
+        }
+
+        dvmFprintf(stderr, "processXjitoffset start = %s\n", start);
+        char* tmp = strdup(start);
+        gDvmJit.pcTable[idx++] = atoi(tmp);
+        free(tmp);
+        if (idx >= COMPILER_PC_OFFSET_SIZE) {
+            dvmFprintf(stderr, "processXjitoffset: ignore entries beyond %d\n", COMPILER_PC_OFFSET_SIZE);
+            break;
+        }
+        if (end) {
+            start = end + 1;
+        } else {
+            break;
+        }
+    } while (1);
+    gDvmJit.num_entries_pcTable = idx;
+    free(buf);
+}
+
+/* Parse -Xjitmethod to selectively turn on/off certain methods for JIT */
+static void processXjitmethod(const char* opt, bool isMethod) {
+    char* buf = strdup(opt);
+
+    if (isMethod && gDvmJit.methodTable == NULL) {
+        gDvmJit.methodTable = dvmHashTableCreate(8, NULL);
+    }
+    if (!isMethod && gDvmJit.classTable == NULL) {
+        gDvmJit.classTable = dvmHashTableCreate(8, NULL);
+    }
+
+    char* start = buf;
+    char* end;
     /*
      * Break comma-separated method signatures and enter them into the hash
      * table individually.
@@ -622,10 +672,9 @@ static void processXjitmethod(const char *opt)
         }
 
         hashValue = dvmComputeUtf8Hash(start);
+        dvmHashTableLookup(isMethod ? gDvmJit.methodTable : gDvmJit.classTable,
+                           hashValue, strdup(start), (HashCompareFunc) strcmp, true);
 
-        dvmHashTableLookup(gDvmJit.methodTable, hashValue,
-                           strdup(start),
-                           (HashCompareFunc) strcmp, true);
         if (end) {
             start = end + 1;
         } else {
@@ -633,6 +682,88 @@ static void processXjitmethod(const char *opt)
         }
     } while (1);
     free(buf);
+}
+
+/* The format of jit_config.list:
+   EXCLUDE or INCLUDE
+   CLASS
+   prefix1 ...
+   METHOD
+   prefix 1 ...
+   OFFSET
+   index ... //each pair is a range, if pcOff falls into a range, JIT
+*/
+static int processXjitconfig(const char* opt) {
+   FILE* fp = fopen(opt, "r");
+   if (fp == NULL) {
+       return -1;
+   }
+
+   char fLine[500];
+   bool startClass = false, startMethod = false, startOffset = false;
+   gDvmJit.num_entries_pcTable = 0;
+   int idx = 0;
+
+   while (fgets(fLine, 500, fp) != NULL) {
+       char* curLine = strtok(fLine, " \t\r\n");
+       /* handles keyword CLASS, METHOD, INCLUDE, EXCLUDE */
+       if (!strncmp(curLine, "CLASS", 5)) {
+           startClass = true;
+           startMethod = false;
+           startOffset = false;
+           continue;
+       }
+       if (!strncmp(curLine, "METHOD", 6)) {
+           startMethod = true;
+           startClass = false;
+           startOffset = false;
+           continue;
+       }
+       if (!strncmp(curLine, "OFFSET", 6)) {
+           startOffset = true;
+           startMethod = false;
+           startClass = false;
+           continue;
+       }
+       if (!strncmp(curLine, "EXCLUDE", 7)) {
+          gDvmJit.includeSelectedMethod = false;
+          continue;
+       }
+       if (!strncmp(curLine, "INCLUDE", 7)) {
+          gDvmJit.includeSelectedMethod = true;
+          continue;
+       }
+       if (!startMethod && !startClass && !startOffset) {
+         continue;
+       }
+
+        int hashValue = dvmComputeUtf8Hash(curLine);
+        if (startMethod) {
+            if (gDvmJit.methodTable == NULL) {
+                gDvmJit.methodTable = dvmHashTableCreate(8, NULL);
+            }
+            dvmHashTableLookup(gDvmJit.methodTable, hashValue,
+                               strdup(curLine),
+                               (HashCompareFunc) strcmp, true);
+        } else if (startClass) {
+            if (gDvmJit.classTable == NULL) {
+                gDvmJit.classTable = dvmHashTableCreate(8, NULL);
+            }
+            dvmHashTableLookup(gDvmJit.classTable, hashValue,
+                               strdup(curLine),
+                               (HashCompareFunc) strcmp, true);
+        } else if (startOffset) {
+           int tmpInt = atoi(curLine);
+           gDvmJit.pcTable[idx++] = tmpInt;
+           if (idx >= COMPILER_PC_OFFSET_SIZE) {
+               printf("processXjitoffset: ignore entries beyond %d\n", COMPILER_PC_OFFSET_SIZE);
+               break;
+           }
+        }
+   }
+   gDvmJit.num_entries_pcTable = idx;
+   fclose(fp);
+   return 0;
 }
 #endif
 
@@ -793,6 +924,38 @@ static int processOptions(int argc, const char* const argv[],
                 dvmFprintf(stderr, "Invalid -XX:HeapGrowthLimit option '%s'\n", argv[i]);
                 return -1;
             }
+        } else if (strncmp(argv[i], "-XX:HeapMinFree=", 16) == 0) {
+            size_t val = parseMemOption(argv[i] + 16, 1024);
+            if (val != 0) {
+                gDvm.heapMinFree = val;
+            } else {
+                dvmFprintf(stderr, "Invalid -XX:HeapMinFree option '%s'\n", argv[i]);
+                return -1;
+            }
+        } else if (strncmp(argv[i], "-XX:HeapMaxFree=", 16) == 0) {
+            size_t val = parseMemOption(argv[i] + 16, 1024);
+            if (val != 0) {
+                gDvm.heapMaxFree = val;
+            } else {
+                dvmFprintf(stderr, "Invalid -XX:HeapMaxFree option '%s'\n", argv[i]);
+                return -1;
+            }
+        } else if (strcmp(argv[i], "-XX:LowMemoryMode") == 0) {
+          gDvm.lowMemoryMode = true;
+        } else if (strncmp(argv[i], "-XX:HeapTargetUtilization=", 26) == 0) {
+            const char* start = argv[i] + 26;
+            const char* end = start;
+            double val = strtod(start, const_cast<char**>(&end));
+            // Ensure that we have a value, there was no cruft after it and it
+            // satisfies a sensible range.
+            bool sane_val = (start != end) && (end[0] == '\0') &&
+                (val >= 0.1) && (val <= 0.9);
+            if (sane_val) {
+                gDvm.heapTargetUtilization = val;
+            } else {
+                dvmFprintf(stderr, "Invalid -XX:HeapTargetUtilization option '%s'\n", argv[i]);
+                return -1;
+            }
         } else if (strncmp(argv[i], "-Xss", 4) == 0) {
             size_t val = parseMemOption(argv[i]+4, 1);
             if (val != 0) {
@@ -946,12 +1109,23 @@ static int processOptions(int argc, const char* const argv[],
 #ifdef WITH_JIT
         } else if (strncmp(argv[i], "-Xjitop", 7) == 0) {
             processXjitop(argv[i]);
-        } else if (strncmp(argv[i], "-Xjitmethod", 11) == 0) {
-            processXjitmethod(argv[i]);
+        } else if (strncmp(argv[i], "-Xjitmethod:", 12) == 0) {
+            processXjitmethod(argv[i] + strlen("-Xjitmethod:"), true);
+        } else if (strncmp(argv[i], "-Xjitclass:", 11) == 0) {
+            processXjitmethod(argv[i] + strlen("-Xjitclass:"), false);
+        } else if (strncmp(argv[i], "-Xjitoffset:", 12) == 0) {
+            processXjitoffset(argv[i] + strlen("-Xjitoffset:"));
+        } else if (strncmp(argv[i], "-Xjitconfig:", 12) == 0) {
+            processXjitconfig(argv[i] + strlen("-Xjitconfig:"));
         } else if (strncmp(argv[i], "-Xjitblocking", 13) == 0) {
           gDvmJit.blockingMode = true;
         } else if (strncmp(argv[i], "-Xjitthreshold:", 15) == 0) {
           gDvmJit.threshold = atoi(argv[i] + 15);
+        } else if (strncmp(argv[i], "-Xjitcodecachesize:", 19) == 0) {
+          gDvmJit.codeCacheSize = atoi(argv[i] + 19) * 1024;
+          if (gDvmJit.codeCacheSize == 0) {
+            gDvm.executionMode = kExecutionModeInterpFast;
+          }
         } else if (strncmp(argv[i], "-Xincludeselectedop", 19) == 0) {
           gDvmJit.includeSelectedOp = true;
         } else if (strncmp(argv[i], "-Xincludeselectedmethod", 23) == 0) {
@@ -960,6 +1134,8 @@ static int processOptions(int argc, const char* const argv[],
           gDvmJit.checkCallGraph = true;
           /* Need to enable blocking mode due to stack crawling */
           gDvmJit.blockingMode = true;
+        } else if (strncmp(argv[i], "-Xjitdumpbin", 12) == 0) {
+          gDvmJit.printBinary = true;
         } else if (strncmp(argv[i], "-Xjitverbose", 12) == 0) {
           gDvmJit.printMe = true;
         } else if (strncmp(argv[i], "-Xjitprofile", 12) == 0) {
@@ -1065,8 +1241,18 @@ static void setCommandLineDefaults()
     gDvm.heapStartingSize = 2 * 1024 * 1024;  // Spec says 16MB; too big for us.
     gDvm.heapMaximumSize = 16 * 1024 * 1024;  // Spec says 75% physical mem
     gDvm.heapGrowthLimit = 0;  // 0 means no growth limit
+    gDvm.lowMemoryMode = false;
     gDvm.stackSize = kDefaultStackSize;
     gDvm.mainThreadStackSize = kDefaultStackSize;
+    // When the heap is less than the maximum or growth limited size,
+    // fix the free portion of the heap. The utilization is the ratio
+    // of live to free memory, 0.5 implies half the heap is available
+    // to allocate into before a GC occurs. Min free and max free
+    // force the free memory to never be smaller than min free or
+    // larger than max free.
+    gDvm.heapTargetUtilization = 0.5;
+    gDvm.heapMaxFree = 2 * 1024 * 1024;
+    gDvm.heapMinFree = gDvm.heapMaxFree / 4;
 
     gDvm.concurrentMarkSweep = true;
 
@@ -1091,6 +1277,15 @@ static void setCommandLineDefaults()
      */
 #if defined(WITH_JIT)
     gDvm.executionMode = kExecutionModeJit;
+    gDvmJit.num_entries_pcTable = 0;
+    gDvmJit.includeSelectedMethod = false;
+    gDvmJit.includeSelectedOffset = false;
+    gDvmJit.methodTable = NULL;
+    gDvmJit.classTable = NULL;
+    gDvmJit.codeCacheSize = DEFAULT_CODE_CACHE_SIZE;
+
+    gDvm.constInit = false;
+    gDvm.commonInit = false;
 #else
     gDvm.executionMode = kExecutionModeInterpFast;
 #endif
@@ -1144,7 +1339,7 @@ static void blockSignals()
 #if defined(WITH_JIT) && defined(WITH_JIT_TUNING)
     sigaddset(&mask, SIGUSR2);      // used to investigate JIT internals
 #endif
-    //sigaddset(&mask, SIGPIPE);
+    sigaddset(&mask, SIGPIPE);
     cc = sigprocmask(SIG_BLOCK, &mask, NULL);
     assert(cc == 0);
 
@@ -1157,12 +1352,6 @@ static void blockSignals()
         cc = sigaction(SIGBUS, &sa, NULL);
         assert(cc == 0);
     }
-#ifdef NDEBUG
-    // assert() is defined to nothing - resulting in
-    // cc: variable defined but not used (which breaks
-    // the build if -Werror is on)
-    (void)cc;
-#endif
 }
 
 class ScopedShutdown {
@@ -1248,6 +1437,7 @@ std::string dvmStartup(int argc, const char* const argv[],
     /*
      * Initialize components.
      */
+    dvmQuasiAtomicsStartup();
     if (!dvmAllocTrackerStartup()) {
         return "dvmAllocTrackerStartup failed";
     }
@@ -1434,6 +1624,23 @@ static bool registerSystemNatives(JNIEnv* pEnv)
     // Must set this before allowing JNI-based method registration.
     self->status = THREAD_NATIVE;
 
+    // First set up JniConstants, which is used by libcore.
+    JniConstants::init(pEnv);
+
+    // Set up our single JNI method.
+    // TODO: factor this out if we add more.
+    jclass c = pEnv->FindClass("java/lang/Class");
+    if (c == NULL) {
+        dvmAbort();
+    }
+    JNIEXPORT jobject JNICALL Java_java_lang_Class_getDex(JNIEnv* env, jclass javaClass);
+    const JNINativeMethod Java_java_lang_Class[] = {
+        { "getDex", "()Lcom/android/dex/Dex;", (void*) Java_java_lang_Class_getDex },
+    };
+    if (pEnv->RegisterNatives(c, Java_java_lang_Class, 1) != JNI_OK) {
+        dvmAbort();
+    }
+
     // Most JNI libraries can just use System.loadLibrary, but you can't
     // if you're the library that implements System.loadLibrary!
     loadJniLibrary("javacore");
@@ -1445,6 +1652,33 @@ static bool registerSystemNatives(JNIEnv* pEnv)
     return true;
 }
 
+/*
+ * Copied and modified slightly from system/core/toolbox/mount.c
+ */
+static std::string getMountsDevDir(const char *arg)
+{
+    char mount_dev[256];
+    char mount_dir[256];
+    int match;
+
+    FILE *fp = fopen("/proc/self/mounts", "r");
+    if (fp == NULL) {
+        ALOGE("Could not open /proc/self/mounts: %s", strerror(errno));
+        return "";
+    }
+
+    while ((match = fscanf(fp, "%255s %255s %*s %*s %*d %*d\n", mount_dev, mount_dir)) != EOF) {
+        mount_dev[255] = 0;
+        mount_dir[255] = 0;
+        if (match == 2 && (strcmp(arg, mount_dir) == 0)) {
+            fclose(fp);
+            return mount_dev;
+        }
+    }
+
+    fclose(fp);
+    return "";
+}
 
 /*
  * Do zygote-mode-only initialization.
@@ -1453,6 +1687,63 @@ static bool initZygote()
 {
     /* zygote goes into its own process group */
     setpgid(0,0);
+
+    // See storage config details at http://source.android.com/tech/storage/
+    // Create private mount namespace shared by all children
+    if (unshare(CLONE_NEWNS) == -1) {
+        SLOGE("Failed to unshare(): %s", strerror(errno));
+        return -1;
+    }
+
+    // Mark rootfs as being a slave so that changes from default
+    // namespace only flow into our children.
+    if (mount("rootfs", "/", NULL, (MS_SLAVE | MS_REC), NULL) == -1) {
+        SLOGE("Failed to mount() rootfs as MS_SLAVE: %s", strerror(errno));
+        return -1;
+    }
+
+    // Create a staging tmpfs that is shared by our children; they will
+    // bind mount storage into their respective private namespaces, which
+    // are isolated from each other.
+    const char* target_base = getenv("EMULATED_STORAGE_TARGET");
+    if (target_base != NULL) {
+        if (mount("tmpfs", target_base, "tmpfs", MS_NOSUID | MS_NODEV,
+                "uid=0,gid=1028,mode=0751") == -1) {
+            SLOGE("Failed to mount tmpfs to %s: %s", target_base, strerror(errno));
+            return -1;
+        }
+    }
+
+    // Mark /system as NOSUID | NODEV
+    const char* android_root = getenv("ANDROID_ROOT");
+
+    if (android_root == NULL) {
+        SLOGE("environment variable ANDROID_ROOT does not exist?!?!");
+        return -1;
+    }
+
+    std::string mountDev(getMountsDevDir(android_root));
+    if (mountDev.empty()) {
+        SLOGE("Unable to find mount point for %s", android_root);
+        return -1;
+    }
+
+    if (mount(mountDev.c_str(), android_root, "none",
+            MS_REMOUNT | MS_NOSUID | MS_NODEV | MS_RDONLY | MS_BIND, NULL) == -1) {
+        SLOGE("Remount of %s failed: %s", android_root, strerror(errno));
+        return -1;
+    }
+
+#ifdef HAVE_ANDROID_OS
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+        // Older kernels don't understand PR_SET_NO_NEW_PRIVS and return
+        // EINVAL. Don't die on such kernels.
+        if (errno != EINVAL) {
+            SLOGE("PR_SET_NO_NEW_PRIVS failed: %s", strerror(errno));
+            return -1;
+        }
+    }
+#endif
 
     return true;
 }
@@ -1463,12 +1754,10 @@ static bool initZygote()
  */
 bool dvmInitAfterZygote()
 {
-#ifndef LOG_NDEBUG
     u8 startHeap, startQuit, startJdwp;
     u8 endHeap, endQuit, endJdwp;
 
     startHeap = dvmGetRelativeTimeUsec();
-#endif
 
     /*
      * Post-zygote heap initialization, including starting
@@ -1477,10 +1766,8 @@ bool dvmInitAfterZygote()
     if (!dvmGcStartupAfterZygote())
         return false;
 
-#ifndef LOG_NDEBUG
     endHeap = dvmGetRelativeTimeUsec();
     startQuit = dvmGetRelativeTimeUsec();
-#endif
 
     /* start signal catcher thread that dumps stacks on SIGQUIT */
     if (!gDvm.reduceSignals && !gDvm.noQuitHandler) {
@@ -1494,10 +1781,8 @@ bool dvmInitAfterZygote()
             return false;
     }
 
-#ifndef LOG_NDEBUG
     endQuit = dvmGetRelativeTimeUsec();
     startJdwp = dvmGetRelativeTimeUsec();
-#endif
 
     /*
      * Start JDWP thread.  If the command-line debugger flags specified
@@ -1508,9 +1793,7 @@ bool dvmInitAfterZygote()
         ALOGD("JDWP init failed; continuing anyway");
     }
 
-#ifndef LOG_NDEBUG
     endJdwp = dvmGetRelativeTimeUsec();
-#endif
 
     ALOGV("thread-start heap=%d quit=%d jdwp=%d total=%d usec",
         (int)(endHeap-startHeap), (int)(endQuit-startQuit),
@@ -1751,6 +2034,8 @@ void dvmShutdown()
 
     freeAssertionCtrl();
 
+    dvmQuasiAtomicsShutdown();
+
     /*
      * We want valgrind to report anything we forget to free as "definitely
      * lost".  If there's a pointer in the global chunk, it would be reported
@@ -1874,17 +2159,6 @@ void dvmAbort()
      */
     dvmPrintNativeBackTrace();
 
-    /*
-     * If we call abort(), all threads in the process receives a SIBABRT.
-     * debuggerd dumps the stack trace of the main thread, whether or not
-     * that was the thread that failed.
-     *
-     * By stuffing a value into a bogus address, we cause a segmentation
-     * fault in the current thread, and get a useful log from debuggerd.
-     * We can also trivially tell the difference between a VM crash and
-     * a deliberate abort by looking at the fault address.
-     */
-    *((char*)0xdeadd00d) = result;
     abort();
 
     /* notreached */

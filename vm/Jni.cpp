@@ -19,6 +19,7 @@
  */
 #include "Dalvik.h"
 #include "JniInternal.h"
+#include "Misc.h"
 #include "ScopedPthreadMutexLock.h"
 #include "UniquePtr.h"
 
@@ -134,6 +135,11 @@ The GC will scan all references in the table.
 
 */
 
+static void ReportJniError() {
+    dvmDumpThread(dvmThreadSelf(), false);
+    dvmAbort();
+}
+
 #ifdef WITH_JNI_STACK_CHECK
 # define COMPUTE_STACK_SUM(_self)   computeStackSum(_self);
 # define CHECK_STACK_SUM(_self)     checkStackSum(_self);
@@ -177,7 +183,7 @@ static void checkStackSum(Thread* self) {
             ALOGD("JNI: bad stack CRC (0x%08x) -- okay during JNI_OnLoad", stackCrc);
         } else {
             ALOGW("JNI: bad stack CRC (%08x vs %08x)", crc, stackCrc);
-            dvmAbort();
+            ReportJniError();
         }
     }
     self->stackCrc = (u4) -1;       /* make logic errors more noticeable */
@@ -279,6 +285,11 @@ void dvmJniShutdown() {
     dvmClearReferenceTable(&gDvm.jniPinRefTable);
 }
 
+bool dvmIsBadJniVersion(int version) {
+  // We don't support JNI_VERSION_1_1. These are the only other valid versions.
+  return version != JNI_VERSION_1_2 && version != JNI_VERSION_1_4 && version != JNI_VERSION_1_6;
+}
+
 /*
  * Find the JNIEnv associated with the current thread.
  *
@@ -314,7 +325,7 @@ Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
             Object* result = self->jniLocalRefTable.get(jobj);
             if (UNLIKELY(result == NULL)) {
                 ALOGE("JNI ERROR (app bug): use of deleted local reference (%p)", jobj);
-                dvmAbort();
+                ReportJniError();
             }
             return result;
         }
@@ -326,7 +337,7 @@ Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
             Object* result = pRefTable->get(jobj);
             if (UNLIKELY(result == NULL)) {
                 ALOGE("JNI ERROR (app bug): use of deleted global reference (%p)", jobj);
-                dvmAbort();
+                ReportJniError();
             }
             return result;
         }
@@ -340,7 +351,7 @@ Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
                 result = NULL;
             } else if (UNLIKELY(result == NULL)) {
                 ALOGE("JNI ERROR (app bug): use of deleted weak global reference (%p)", jobj);
-                dvmAbort();
+                ReportJniError();
             }
             return result;
         }
@@ -351,7 +362,7 @@ Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
             return reinterpret_cast<Object*>(jobj);
         }
         ALOGW("Invalid indirect reference %p in decodeIndirectRef", jobj);
-        dvmAbort();
+        ReportJniError();
         return kInvalidIndirectRefObject;
     }
 }
@@ -359,8 +370,7 @@ Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
 static void AddLocalReferenceFailure(IndirectRefTable* pRefTable) {
     pRefTable->dump("JNI local");
     ALOGE("Failed adding to JNI local ref table (has %zd entries)", pRefTable->capacity());
-    dvmDumpThread(dvmThreadSelf(), false);
-    dvmAbort();     // spec says call FatalError; this is equivalent
+    ReportJniError(); // spec says call FatalError; this is equivalent
 }
 
 /*
@@ -384,6 +394,7 @@ static inline jobject addLocalReference(Thread* self, Object* obj) {
     if (UNLIKELY(jobj == NULL)) {
         AddLocalReferenceFailure(pRefTable);
     }
+
     if (UNLIKELY(gDvmJni.workAroundAppJniBugs)) {
         // Hand out direct pointers to support broken old apps.
         return reinterpret_cast<jobject>(obj);
@@ -482,7 +493,7 @@ static jobject addGlobalReference(Object* obj) {
         gDvm.jniGlobalRefTable.dump("JNI global");
         ALOGE("Failed adding to JNI global ref table (%zd entries)",
                 gDvm.jniGlobalRefTable.capacity());
-        dvmAbort();
+        ReportJniError();
     }
 
     LOGVV("GREF add %p  (%s.%s)", obj,
@@ -503,7 +514,7 @@ static jobject addWeakGlobalReference(Object* obj) {
     if (jobj == NULL) {
         gDvm.jniWeakGlobalRefTable.dump("JNI weak global");
         ALOGE("Failed adding to JNI weak global ref table (%zd entries)", table->capacity());
-        dvmAbort();
+        ReportJniError();
     }
     return jobj;
 }
@@ -556,8 +567,7 @@ static void pinPrimitiveArray(ArrayObject* arrayObj) {
         dvmDumpReferenceTable(&gDvm.jniPinRefTable, "JNI pinned array");
         ALOGE("Failed adding to JNI pinned array ref table (%d entries)",
            (int) dvmReferenceTableEntries(&gDvm.jniPinRefTable));
-        dvmDumpThread(dvmThreadSelf(), false);
-        dvmAbort();
+        ReportJniError();
     }
 
     /*
@@ -612,6 +622,31 @@ void dvmDumpJniReferenceTables() {
     dvmDumpReferenceTable(&gDvm.jniPinRefTable, "JNI pinned array");
 }
 
+void dvmDumpJniStats(DebugOutputTarget* target) {
+    dvmPrintDebugMessage(target, "JNI: CheckJNI is %s", gDvmJni.useCheckJni ? "on" : "off");
+    if (gDvmJni.forceCopy) {
+        dvmPrintDebugMessage(target, " (with forcecopy)");
+    }
+    dvmPrintDebugMessage(target, "; workarounds are %s", gDvmJni.workAroundAppJniBugs ? "on" : "off");
+
+    dvmLockMutex(&gDvm.jniPinRefLock);
+    dvmPrintDebugMessage(target, "; pins=%d", dvmReferenceTableEntries(&gDvm.jniPinRefTable));
+    dvmUnlockMutex(&gDvm.jniPinRefLock);
+
+    dvmLockMutex(&gDvm.jniGlobalRefLock);
+    dvmPrintDebugMessage(target, "; globals=%d", gDvm.jniGlobalRefTable.capacity());
+    dvmUnlockMutex(&gDvm.jniGlobalRefLock);
+
+    dvmLockMutex(&gDvm.jniWeakGlobalRefLock);
+    size_t weaks = gDvm.jniWeakGlobalRefTable.capacity();
+    if (weaks > 0) {
+        dvmPrintDebugMessage(target, " (plus %d weak)", weaks);
+    }
+    dvmUnlockMutex(&gDvm.jniWeakGlobalRefLock);
+
+    dvmPrintDebugMessage(target, "\n\n");
+}
+
 /*
  * Verify that a reference passed in from native code is one that the
  * code is allowed to have.
@@ -663,6 +698,11 @@ static void dumpCandidateMethods(ClassObject* clazz, const char* methodName, con
     dumpMethods(clazz->directMethods, clazz->directMethodCount, methodName);
 }
 
+static void throwNoSuchMethodError(ClassObject* c, const char* name, const char* sig, const char* kind) {
+    std::string msg(StringPrintf("no %s method \"%s.%s%s\"", kind, c->descriptor, name, sig));
+    dvmThrowNoSuchMethodError(msg.c_str());
+}
+
 /*
  * Register a method that uses JNI calling conventions.
  */
@@ -688,11 +728,13 @@ static bool dvmRegisterJNIMethod(ClassObject* clazz, const char* methodName,
     }
     if (method == NULL) {
         dumpCandidateMethods(clazz, methodName, signature);
+        throwNoSuchMethodError(clazz, methodName, signature, "static or non-static");
         return false;
     }
 
     if (!dvmIsNativeMethod(method)) {
         ALOGW("Unable to register: not native: %s.%s:%s", clazz->descriptor, methodName, signature);
+        throwNoSuchMethodError(clazz, methodName, signature, "native");
         return false;
     }
 
@@ -920,14 +962,14 @@ static void trackMonitorEnter(Thread* self, Object* obj) {
 
         if (!dvmInitReferenceTable(refTable, kInitialSize, INT_MAX)) {
             ALOGE("Unable to initialize monitor tracking table");
-            dvmAbort();
+            ReportJniError();
         }
     }
 
     if (!dvmAddToReferenceTable(refTable, obj)) {
         /* ran out of memory? could throw exception instead */
         ALOGE("Unable to add entry to monitor tracking table");
-        dvmAbort();
+        ReportJniError();
     } else {
         LOGVV("--- added monitor %p", obj);
     }
@@ -1364,7 +1406,7 @@ static void ExceptionClear(JNIEnv* env) {
 static void FatalError(JNIEnv* env, const char* msg) {
     //dvmChangeStatus(NULL, THREAD_RUNNING);
     ALOGE("JNI posting fatal error: %s", msg);
-    dvmAbort();
+    ReportJniError();
 }
 
 /*
@@ -2268,7 +2310,7 @@ static void SetObjectArrayElement(JNIEnv* env, jobjectArray jarr, jsize index, j
     if (obj != NULL && !dvmCanPutArrayElement(obj->clazz, arrayObj->clazz)) {
       ALOGV("Can't put a '%s'(%p) into array type='%s'(%p)",
             obj->clazz->descriptor, obj,
-            arrayObj->obj.clazz->descriptor, arrayObj);
+            arrayObj->clazz->descriptor, arrayObj);
       dvmThrowArrayStoreExceptionIncompatibleElement(obj->clazz, arrayObj->clazz);
       return;
     }
@@ -2645,15 +2687,21 @@ static jobjectRefType GetObjectRefType(JNIEnv* env, jobject jobj) {
 
 /*
  * Allocate and return a new java.nio.ByteBuffer for this block of memory.
- *
- * "address" may not be NULL, and "capacity" must be > 0.  (These are only
- * verified when CheckJNI is enabled.)
  */
 static jobject NewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity) {
     ScopedJniThreadState ts(env);
 
-    /* create an instance of java.nio.ReadWriteDirectByteBuffer */
-    ClassObject* bufferClazz = gDvm.classJavaNioReadWriteDirectByteBuffer;
+    if (capacity < 0) {
+        ALOGE("JNI ERROR (app bug): negative buffer capacity: %lld", capacity);
+        ReportJniError();
+    }
+    if (address == NULL && capacity != 0) {
+        ALOGE("JNI ERROR (app bug): non-zero capacity for NULL pointer: %lld", capacity);
+        ReportJniError();
+    }
+
+    /* create an instance of java.nio.DirectByteBuffer */
+    ClassObject* bufferClazz = gDvm.classJavaNioDirectByteBuffer;
     if (!dvmIsClassInitialized(bufferClazz) && !dvmInitClass(bufferClazz)) {
         return NULL;
     }
@@ -2664,8 +2712,8 @@ static jobject NewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity) {
     /* call the constructor */
     jobject result = addLocalReference(ts.self(), newObj);
     JValue unused;
-    dvmCallMethod(ts.self(), gDvm.methJavaNioReadWriteDirectByteBuffer_init,
-            newObj, &unused, (jint) address, (jint) capacity);
+    dvmCallMethod(ts.self(), gDvm.methJavaNioDirectByteBuffer_init,
+            newObj, &unused, (jlong) address, (jint) capacity);
     if (dvmGetException(ts.self()) != NULL) {
         deleteLocalReference(ts.self(), result);
         return NULL;
@@ -2683,7 +2731,7 @@ static void* GetDirectBufferAddress(JNIEnv* env, jobject jbuf) {
 
     // All Buffer objects have an effectiveDirectAddress field.
     Object* bufObj = dvmDecodeIndirectRef(ts.self(), jbuf);
-    return (void*) dvmGetFieldInt(bufObj, gDvm.offJavaNioBuffer_effectiveDirectAddress);
+    return (void*) dvmGetFieldLong(bufObj, gDvm.offJavaNioBuffer_effectiveDirectAddress);
 }
 
 /*
@@ -2771,7 +2819,12 @@ static jint attachThread(JavaVM* vm, JNIEnv** p_env, void* thr_args, bool isDaem
         argsCopy.name = NULL;
         argsCopy.group = (jobject) dvmGetMainThreadGroup();
     } else {
-        assert(args->version >= JNI_VERSION_1_2);
+        if (dvmIsBadJniVersion(args->version)) {
+            ALOGE("Bad JNI version passed to %s: %d",
+                  (isDaemon ? "AttachCurrentThreadAsDaemon" : "AttachCurrentThread"),
+                  args->version);
+            return JNI_EVERSION;
+        }
 
         argsCopy.version = args->version;
         argsCopy.name = args->name;
@@ -2851,7 +2904,10 @@ static jint DetachCurrentThread(JavaVM* vm) {
 static jint GetEnv(JavaVM* vm, void** env, jint version) {
     Thread* self = dvmThreadSelf();
 
-    if (version < JNI_VERSION_1_1 || version > JNI_VERSION_1_6) {
+    // GetEnv also accepts JNI_VERSION_1_1, but always returns a JNIEnv*
+    // corresponding to the most current supported JNI version.
+    if (dvmIsBadJniVersion(version) && version != JNI_VERSION_1_1) {
+        ALOGE("Bad JNI version passed to GetEnv: %d", version);
         return JNI_EVERSION;
     }
 
@@ -3367,7 +3423,8 @@ jint JNI_GetCreatedJavaVMs(JavaVM** vmBuf, jsize bufLen, jsize* nVMs) {
  */
 jint JNI_CreateJavaVM(JavaVM** p_vm, JNIEnv** p_env, void* vm_args) {
     const JavaVMInitArgs* args = (JavaVMInitArgs*) vm_args;
-    if (args->version < JNI_VERSION_1_2) {
+    if (dvmIsBadJniVersion(args->version)) {
+        ALOGE("Bad JNI version passed to CreateJavaVM: %d", args->version);
         return JNI_EVERSION;
     }
 

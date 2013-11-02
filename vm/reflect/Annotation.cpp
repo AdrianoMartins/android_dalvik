@@ -598,10 +598,6 @@ static Object* convertReturnType(Object* valueObj, ClassObject* methodReturn)
     }
     ALOGV("HEY: converting valueObj from [%s to [%s",
         srcElemClass->descriptor, dstElemClass->descriptor);
-#ifdef LOG_NDEBUG
-    // variable defined but not used => breakage on -Werror
-    (void)srcElemClass;
-#endif
 
     ArrayObject* srcArray = (ArrayObject*) valueObj;
     u4 length = srcArray->length;
@@ -670,9 +666,7 @@ static Object* createAnnotationMember(const ClassObject* clazz,
     valueObj = (Object*)avalue.value.l;
 
     /* new member to hold the element */
-    newMember =
-        dvmAllocObject(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMember,
-        ALLOC_DEFAULT);
+    newMember = dvmAllocObject(gDvm.classLibcoreReflectAnnotationMember, ALLOC_DEFAULT);
     name = dexStringById(pDexFile, elementNameIdx);
     nameObj = dvmCreateStringFromCstr(name);
 
@@ -683,7 +677,7 @@ static Object* createAnnotationMember(const ClassObject* clazz,
             ALOGW("WARNING: could not find annotation member %s in %s",
                 name, annoClass->descriptor);
         } else {
-            methodObj = dvmCreateReflectMethodObject(annoMeth);
+            methodObj = dvmCreateReflectObjForMethod(annoClass, annoMeth);
             methodReturn = dvmGetBoxedReturnType(annoMeth);
         }
     }
@@ -762,6 +756,7 @@ static Object* processEncodedAnnotation(const ClassObject* clazz,
             ALOGE("Unable to resolve %s annotation class %d",
                 clazz->descriptor, typeIdx);
             assert(dvmCheckException(self));
+            dvmClearException(self);
             return NULL;
         }
     }
@@ -778,9 +773,8 @@ static Object* processEncodedAnnotation(const ClassObject* clazz,
     JValue result;
 
     if (size > 0) {
-        elementArray = dvmAllocArrayByClass(
-            gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMemberArray,
-            size, ALLOC_DEFAULT);
+        elementArray = dvmAllocArrayByClass(gDvm.classLibcoreReflectAnnotationMemberArray,
+                                            size, ALLOC_DEFAULT);
         if (elementArray == NULL) {
             ALOGE("failed to allocate annotation member array (%d elements)",
                 size);
@@ -834,49 +828,64 @@ static ArrayObject* processAnnotationSet(const ClassObject* clazz,
 {
     DexFile* pDexFile = clazz->pDvmDex->pDexFile;
     const DexAnnotationItem* pAnnoItem;
-    ArrayObject* annoArray;
-    int i, count;
-    u4 dstIndex;
 
     /* we need these later; make sure they're initialized */
-    if (!dvmIsClassInitialized(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationFactory))
-        dvmInitClass(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationFactory);
-    if (!dvmIsClassInitialized(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMember))
-        dvmInitClass(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMember);
+    if (!dvmIsClassInitialized(gDvm.classLibcoreReflectAnnotationFactory))
+        dvmInitClass(gDvm.classLibcoreReflectAnnotationFactory);
+    if (!dvmIsClassInitialized(gDvm.classLibcoreReflectAnnotationMember))
+        dvmInitClass(gDvm.classLibcoreReflectAnnotationMember);
 
     /* count up the number of visible elements */
-    for (i = count = 0; i < (int) pAnnoSet->size; i++) {
+    size_t count = 0;
+    for (size_t i = 0; i < pAnnoSet->size; ++i) {
         pAnnoItem = dexGetAnnotationItem(pDexFile, pAnnoSet, i);
-        if (pAnnoItem->visibility == visibility)
+        if (pAnnoItem->visibility == visibility) {
             count++;
+        }
     }
 
-    annoArray =
-        dvmAllocArrayByClass(gDvm.classJavaLangAnnotationAnnotationArray,
-                             count, ALLOC_DEFAULT);
-    if (annoArray == NULL)
+    ArrayObject* annoArray = dvmAllocArrayByClass(gDvm.classJavaLangAnnotationAnnotationArray,
+                                                  count, ALLOC_DEFAULT);
+    if (annoArray == NULL) {
         return NULL;
+    }
 
     /*
      * Generate Annotation objects.  We must put them into the array
      * immediately (or add them to the tracked ref table).
+     * We may not be able to resolve all annotations, and should just
+     * ignore those we can't.
      */
-    dstIndex = 0;
-    for (i = 0; i < (int) pAnnoSet->size; i++) {
+    u4 dstIndex = 0;
+    for (int i = 0; i < (int) pAnnoSet->size; i++) {
         pAnnoItem = dexGetAnnotationItem(pDexFile, pAnnoSet, i);
         if (pAnnoItem->visibility != visibility)
             continue;
         const u1* ptr = pAnnoItem->annotation;
         Object *anno = processEncodedAnnotation(clazz, &ptr);
-        if (anno == NULL) {
-            dvmReleaseTrackedAlloc((Object*) annoArray, NULL);
-            return NULL;
+        if (anno != NULL) {
+            dvmSetObjectArrayElement(annoArray, dstIndex, anno);
+            ++dstIndex;
         }
-        dvmSetObjectArrayElement(annoArray, dstIndex, anno);
-        ++dstIndex;
     }
 
-    return annoArray;
+    // If we got as many as we expected, we're done...
+    if (dstIndex == count) {
+        return annoArray;
+    }
+
+    // ...otherwise we need to trim the trailing nulls.
+    ArrayObject* trimmedArray = dvmAllocArrayByClass(gDvm.classJavaLangAnnotationAnnotationArray,
+                                                     dstIndex, ALLOC_DEFAULT);
+    if (trimmedArray == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < dstIndex; ++i) {
+        Object** src = (Object**)(void*) annoArray->contents;
+        dvmSetObjectArrayElement(trimmedArray, i, src[i]);
+    }
+    dvmReleaseTrackedAlloc((Object*) annoArray, NULL);
+    return trimmedArray;
 }
 
 /*
@@ -895,10 +904,10 @@ static const DexAnnotationItem* getAnnotationItemFromAnnotationSet(
     u4 typeIdx;
 
     /* we need these later; make sure they're initialized */
-    if (!dvmIsClassInitialized(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationFactory))
-        dvmInitClass(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationFactory);
-    if (!dvmIsClassInitialized(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMember))
-        dvmInitClass(gDvm.classOrgApacheHarmonyLangAnnotationAnnotationMember);
+    if (!dvmIsClassInitialized(gDvm.classLibcoreReflectAnnotationFactory))
+        dvmInitClass(gDvm.classLibcoreReflectAnnotationFactory);
+    if (!dvmIsClassInitialized(gDvm.classLibcoreReflectAnnotationMember))
+        dvmInitClass(gDvm.classLibcoreReflectAnnotationMember);
 
     for (i = 0; i < (int) pAnnoSet->size; i++) {
         pAnnoItem = dexGetAnnotationItem(pDexFile, pAnnoSet, i);
@@ -912,7 +921,12 @@ static const DexAnnotationItem* getAnnotationItemFromAnnotationSet(
         if (annoClass == NULL) {
             annoClass = dvmResolveClass(clazz, typeIdx, true);
             if (annoClass == NULL) {
-                return NULL; // an exception is pending
+                ALOGE("Unable to resolve %s annotation class %d",
+                      clazz->descriptor, typeIdx);
+                Thread* self = dvmThreadSelf();
+                assert(dvmCheckException(self));
+                dvmClearException(self);
+                continue;
             }
         }
 
@@ -1105,9 +1119,9 @@ static const u1* searchEncodedAnnotation(const ClassObject* clazz,
     const u1* ptr, const char* name)
 {
     DexFile* pDexFile = clazz->pDvmDex->pDexFile;
-    u4 /*typeIdx,*/ size;
+    u4 typeIdx, size;
 
-    /*typeIdx =*/ readUleb128(&ptr);
+    typeIdx = readUleb128(&ptr);
     size = readUleb128(&ptr);
     //printf("#####   searching ptr=%p type=%u size=%u\n", ptr, typeIdx, size);
 
@@ -1596,8 +1610,10 @@ static int compareMethodStr(DexFile* pDexFile, u4 methodIdx,
  * out reasonably well because it's in sorted order, though we're still left
  * doing a fair number of string comparisons.
  */
-static u4 getMethodIdx(const Method* method)
+u4 dvmGetMethodIdx(const Method* method)
 {
+    if (method->clazz->pDvmDex == NULL) return 0;
+
     DexFile* pDexFile = method->clazz->pDvmDex->pDexFile;
     u4 hi = pDexFile->pHeader->methodIdsSize -1;
     u4 lo = 0;
@@ -1662,7 +1678,7 @@ static const DexAnnotationSetItem* findAnnotationSetForMethod(
              * find the method definition in the DEX file and perform string
              * comparisons on class name, method name, and signature.
              */
-            u4 methodIdx = getMethodIdx(method);
+            u4 methodIdx = dvmGetMethodIdx(method);
             u4 count = dexGetMethodAnnotationsSize(pDexFile, pAnnoDir);
             u4 idx;
 
@@ -1904,10 +1920,12 @@ static int compareFieldStr(DexFile* pDexFile, u4 idx, const Field* field)
 /*
  * Given a field, determine the field's index.
  *
- * This has the same tradeoffs as getMethodIdx.
+ * This has the same tradeoffs as dvmGetMethodIdx.
  */
-static u4 getFieldIdx(const Field* field)
+u4 dvmGetFieldIdx(const Field* field)
 {
+    if (field->clazz->pDvmDex == NULL) return 0;
+
     DexFile* pDexFile = field->clazz->pDvmDex->pDexFile;
     u4 hi = pDexFile->pHeader->fieldIdsSize -1;
     u4 lo = 0;
@@ -1945,17 +1963,22 @@ static u4 getFieldIdx(const Field* field)
 static const DexAnnotationSetItem* findAnnotationSetForField(const Field* field)
 {
     ClassObject* clazz = field->clazz;
-    DexFile* pDexFile = clazz->pDvmDex->pDexFile;
-    const DexAnnotationsDirectoryItem* pAnnoDir;
-    const DexFieldAnnotationsItem* pFieldList;
-
-    pAnnoDir = getAnnoDirectory(pDexFile, clazz);
-    if (pAnnoDir == NULL)
+    DvmDex* pDvmDex = clazz->pDvmDex;
+    if (pDvmDex == NULL) {
         return NULL;
+    }
 
-    pFieldList = dexGetFieldAnnotations(pDexFile, pAnnoDir);
-    if (pFieldList == NULL)
+    DexFile* pDexFile = pDvmDex->pDexFile;
+
+    const DexAnnotationsDirectoryItem* pAnnoDir = getAnnoDirectory(pDexFile, clazz);
+    if (pAnnoDir == NULL) {
         return NULL;
+    }
+
+    const DexFieldAnnotationsItem* pFieldList = dexGetFieldAnnotations(pDexFile, pAnnoDir);
+    if (pFieldList == NULL) {
+        return NULL;
+    }
 
     /*
      * Run through the list and find a matching field.  We compare the
@@ -1968,7 +1991,7 @@ static const DexAnnotationSetItem* findAnnotationSetForField(const Field* field)
      * find the field definition in the DEX file and perform string
      * comparisons on class name, field name, and signature.
      */
-    u4 fieldIdx = getFieldIdx(field);
+    u4 fieldIdx = dvmGetFieldIdx(field);
     u4 count = dexGetFieldAnnotationsSize(pDexFile, pAnnoDir);
     u4 idx;
 
@@ -2089,9 +2112,15 @@ static ArrayObject* processAnnotationSetRefList(const ClassObject* clazz,
         const DexAnnotationSetRefItem* pItem;
         const DexAnnotationSetItem* pAnnoSet;
         Object *annoSet;
+        DexAnnotationSetItem emptySet;
+        emptySet.size = 0;
 
         pItem = dexGetParameterAnnotationSetRef(pAnnoSetList, idx);
         pAnnoSet = dexGetSetRefItemItem(pDexFile, pItem);
+        if (pAnnoSet == NULL) {
+            pAnnoSet = &emptySet;
+        }
+
         annoSet = (Object *)processAnnotationSet(clazz,
                                                  pAnnoSet,
                                                  kDexVisibilityRuntime);
@@ -2144,7 +2173,7 @@ static const DexParameterAnnotationsItem* findAnnotationsItemForMethod(
      * find the method definition in the DEX file and perform string
      * comparisons on class name, method name, and signature.
      */
-    u4 methodIdx = getMethodIdx(method);
+    u4 methodIdx = dvmGetMethodIdx(method);
     u4 count = dexGetParameterAnnotationsSize(pDexFile, pAnnoDir);
     u4 idx;
 

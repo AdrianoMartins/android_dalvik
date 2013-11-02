@@ -398,6 +398,149 @@ static void genIPut(CompilationUnit *cUnit, MIR *mir, OpSize size,
     }
 }
 
+
+/*
+ * Generate array load
+ */
+static void genArrayGet(CompilationUnit *cUnit, MIR *mir, OpSize size,
+                        RegLocation rlArray, RegLocation rlIndex,
+                        RegLocation rlDest, int scale)
+{
+    RegisterClass regClass = dvmCompilerRegClassBySize(size);
+    int lenOffset = OFFSETOF_MEMBER(ArrayObject, length);
+    int dataOffset = OFFSETOF_MEMBER(ArrayObject, contents);
+    RegLocation rlResult;
+    rlArray = loadValue(cUnit, rlArray, kCoreReg);
+    rlIndex = loadValue(cUnit, rlIndex, kCoreReg);
+    int regPtr;
+
+    /* null object? */
+    ArmLIR * pcrLabel = NULL;
+
+    if (!(mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK)) {
+        pcrLabel = genNullCheck(cUnit, rlArray.sRegLow,
+                                rlArray.lowReg, mir->offset, NULL);
+    }
+
+    regPtr = dvmCompilerAllocTemp(cUnit);
+
+    if (!(mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK)) {
+        int regLen = dvmCompilerAllocTemp(cUnit);
+        /* Get len */
+        loadWordDisp(cUnit, rlArray.lowReg, lenOffset, regLen);
+        /* regPtr -> array data */
+        opRegRegImm(cUnit, kOpAdd, regPtr, rlArray.lowReg, dataOffset);
+        genBoundsCheck(cUnit, rlIndex.lowReg, regLen, mir->offset,
+                       pcrLabel);
+        dvmCompilerFreeTemp(cUnit, regLen);
+    } else {
+        /* regPtr -> array data */
+        opRegRegImm(cUnit, kOpAdd, regPtr, rlArray.lowReg, dataOffset);
+    }
+    if ((size == kLong) || (size == kDouble)) {
+        if (scale) {
+            int rNewIndex = dvmCompilerAllocTemp(cUnit);
+            opRegRegImm(cUnit, kOpLsl, rNewIndex, rlIndex.lowReg, scale);
+            opRegReg(cUnit, kOpAdd, regPtr, rNewIndex);
+            dvmCompilerFreeTemp(cUnit, rNewIndex);
+        } else {
+            opRegReg(cUnit, kOpAdd, regPtr, rlIndex.lowReg);
+        }
+        rlResult = dvmCompilerEvalLoc(cUnit, rlDest, regClass, true);
+
+        HEAP_ACCESS_SHADOW(true);
+        loadPair(cUnit, regPtr, rlResult.lowReg, rlResult.highReg);
+        HEAP_ACCESS_SHADOW(false);
+
+        dvmCompilerFreeTemp(cUnit, regPtr);
+        storeValueWide(cUnit, rlDest, rlResult);
+    } else {
+        rlResult = dvmCompilerEvalLoc(cUnit, rlDest, regClass, true);
+
+        HEAP_ACCESS_SHADOW(true);
+        loadBaseIndexed(cUnit, regPtr, rlIndex.lowReg, rlResult.lowReg,
+                        scale, size);
+        HEAP_ACCESS_SHADOW(false);
+
+        dvmCompilerFreeTemp(cUnit, regPtr);
+        storeValue(cUnit, rlDest, rlResult);
+    }
+}
+
+/*
+ * Generate array store
+ *
+ */
+static void genArrayPut(CompilationUnit *cUnit, MIR *mir, OpSize size,
+                        RegLocation rlArray, RegLocation rlIndex,
+                        RegLocation rlSrc, int scale)
+{
+    RegisterClass regClass = dvmCompilerRegClassBySize(size);
+    int lenOffset = OFFSETOF_MEMBER(ArrayObject, length);
+    int dataOffset = OFFSETOF_MEMBER(ArrayObject, contents);
+
+    int regPtr;
+    rlArray = loadValue(cUnit, rlArray, kCoreReg);
+    rlIndex = loadValue(cUnit, rlIndex, kCoreReg);
+
+    if (dvmCompilerIsTemp(cUnit, rlArray.lowReg)) {
+        dvmCompilerClobber(cUnit, rlArray.lowReg);
+        regPtr = rlArray.lowReg;
+    } else {
+        regPtr = dvmCompilerAllocTemp(cUnit);
+        genRegCopy(cUnit, regPtr, rlArray.lowReg);
+    }
+
+    /* null object? */
+    ArmLIR * pcrLabel = NULL;
+
+    if (!(mir->OptimizationFlags & MIR_IGNORE_NULL_CHECK)) {
+        pcrLabel = genNullCheck(cUnit, rlArray.sRegLow, rlArray.lowReg,
+                                mir->offset, NULL);
+    }
+
+    if (!(mir->OptimizationFlags & MIR_IGNORE_RANGE_CHECK)) {
+        int regLen = dvmCompilerAllocTemp(cUnit);
+        //NOTE: max live temps(4) here.
+        /* Get len */
+        loadWordDisp(cUnit, rlArray.lowReg, lenOffset, regLen);
+        /* regPtr -> array data */
+        opRegImm(cUnit, kOpAdd, regPtr, dataOffset);
+        genBoundsCheck(cUnit, rlIndex.lowReg, regLen, mir->offset,
+                       pcrLabel);
+        dvmCompilerFreeTemp(cUnit, regLen);
+    } else {
+        /* regPtr -> array data */
+        opRegImm(cUnit, kOpAdd, regPtr, dataOffset);
+    }
+    /* at this point, regPtr points to array, 2 live temps */
+    if ((size == kLong) || (size == kDouble)) {
+        //TODO: need specific wide routine that can handle fp regs
+        if (scale) {
+            int rNewIndex = dvmCompilerAllocTemp(cUnit);
+            opRegRegImm(cUnit, kOpLsl, rNewIndex, rlIndex.lowReg, scale);
+            opRegReg(cUnit, kOpAdd, regPtr, rNewIndex);
+            dvmCompilerFreeTemp(cUnit, rNewIndex);
+        } else {
+            opRegReg(cUnit, kOpAdd, regPtr, rlIndex.lowReg);
+        }
+        rlSrc = loadValueWide(cUnit, rlSrc, regClass);
+
+        HEAP_ACCESS_SHADOW(true);
+        storePair(cUnit, regPtr, rlSrc.lowReg, rlSrc.highReg);
+        HEAP_ACCESS_SHADOW(false);
+
+        dvmCompilerFreeTemp(cUnit, regPtr);
+    } else {
+        rlSrc = loadValue(cUnit, rlSrc, regClass);
+
+        HEAP_ACCESS_SHADOW(true);
+        storeBaseIndexed(cUnit, regPtr, rlIndex.lowReg, rlSrc.lowReg,
+                         scale, size);
+        HEAP_ACCESS_SHADOW(false);
+    }
+}
+
 /*
  * Generate array object store
  * Must use explicit register allocation here because of
@@ -1247,7 +1390,7 @@ static void genInterpSingleStep(CompilationUnit *cUnit, MIR *mir)
     opReg(cUnit, kOpBlx, r2);
 }
 
-#if defined(_ARMV5TE) || defined(_ARMV5TE_VFP) || defined(_ARMV6J) || defined(_ARMV6_VFP)
+#if defined(_ARMV5TE) || defined(_ARMV5TE_VFP)
 /*
  * To prevent a thread in a monitor wait from blocking the Jit from
  * resetting the code cache, heavyweight monitor lock will not
@@ -2086,9 +2229,7 @@ static bool handleEasyMultiply(CompilationUnit *cUnit,
     // Can we simplify this multiplication?
     bool powerOfTwo = false;
     bool popCountLE2 = false;
-#ifndef NDEBUG
-    bool powerOfTwoMinusOne = false; // used only in assert
-#endif
+    bool powerOfTwoMinusOne = false;
     if (lit < 2) {
         // Avoid special cases.
         return false;
@@ -2097,9 +2238,7 @@ static bool handleEasyMultiply(CompilationUnit *cUnit,
     } else if (isPopCountLE2(lit)) {
         popCountLE2 = true;
     } else if (isPowerOfTwo(lit + 1)) {
-#ifndef NDEBUG
         powerOfTwoMinusOne = true;
-#endif
     } else {
         return false;
     }
@@ -2645,16 +2784,16 @@ static bool handleFmt23x(CompilationUnit *cUnit, MIR *mir)
  * chaining cell for case default [8 bytes]
  * noChain exit
  */
-static s8 findPackedSwitchIndex(const u2* switchData, int testVal, int pc)
+static u8 findPackedSwitchIndex(const u2* switchData, int testVal, uintptr_t pc)
 {
     int size;
     int firstKey;
     const int *entries;
     int index;
     int jumpIndex;
-    int caseDPCOffset = 0;
+    uintptr_t caseDPCOffset = 0;
     /* In Thumb mode pc is 4 ahead of the "mov r2, pc" instruction */
-    int chainingPC = (pc + 4) & ~3;
+    uintptr_t chainingPC = (pc + 4) & ~3;
 
     /*
      * Packed switch data format:
@@ -2693,16 +2832,16 @@ static s8 findPackedSwitchIndex(const u2* switchData, int testVal, int pc)
     }
 
     chainingPC += jumpIndex * CHAIN_CELL_NORMAL_SIZE;
-    return (((s8) caseDPCOffset) << 32) | (u8) chainingPC;
+    return (((u8) caseDPCOffset) << 32) | (u8) chainingPC;
 }
 
 /* See comments for findPackedSwitchIndex */
-static s8 findSparseSwitchIndex(const u2* switchData, int testVal, int pc)
+static u8 findSparseSwitchIndex(const u2* switchData, int testVal, uintptr_t pc)
 {
     int size;
     const int *keys;
     const int *entries;
-    int chainingPC = (pc + 4) & ~3;
+    uintptr_t chainingPC = (pc + 4) & ~3;
     int i;
 
     /*
@@ -2744,7 +2883,7 @@ static s8 findSparseSwitchIndex(const u2* switchData, int testVal, int pc)
             int jumpIndex = (i < MAX_CHAINED_SWITCH_CASES) ?
                            i : MAX_CHAINED_SWITCH_CASES + 1;
             chainingPC += jumpIndex * CHAIN_CELL_NORMAL_SIZE;
-            return (((s8) entries[i]) << 32) | (u8) chainingPC;
+            return (((u8) entries[i]) << 32) | (u8) chainingPC;
         } else if (k > testVal) {
             break;
         }
@@ -3699,7 +3838,7 @@ static void handlePCReconstruction(CompilationUnit *cUnit,
      * We should never reach here through fall-through code, so insert
      * a bomb to signal troubles immediately.
      */
-    if ((numElems) || (cUnit->jitMode == kJitLoop)) {
+    if (numElems) {
         newLIR0(cUnit, kThumbUndefined);
     }
 
@@ -4354,7 +4493,6 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                                  (LIR *) cUnit->loopAnalysis->branchToBody);
             dvmCompilerAppendLIR(cUnit,
                                  (LIR *) cUnit->loopAnalysis->branchToPCR);
-            cUnit->loopAnalysis->branchesAdded = true;
         }
 
         if (headLIR) {
